@@ -1,0 +1,25 @@
+{
+  "branches": {
+    "coverage": "-",
+    "missed": 0,
+    "total": 0
+  },
+  "functions": {
+    "coverage": "72.16%",
+    "missed": 1374,
+    "total": 4936
+  },
+  "generated_at": "2026-08-06T02:43:53Z",
+  "lines": {
+    "coverage": "76.25%",
+    "missed": 9664,
+    "total": 40690
+  },
+  "package": "workspace",
+  "regions": {
+    "coverage": "75.37%",
+    "missed": 14019,
+    "total": 56909
+  },
+  "run_url": "https://github.com/YXalix/AgentENV/actions/runs/31065260199"
+}
