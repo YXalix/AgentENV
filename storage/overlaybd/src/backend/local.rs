@@ -102,6 +102,17 @@ impl LocalFileBuilder {
         }
 
         let file = options.open(&path).await?;
+        let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+        tracing::info!(
+            path = %path.display(),
+            read = self.read,
+            write = self.write,
+            create = self.create,
+            truncate = self.truncate,
+            direct_io = self.direct_io,
+            size,
+            "local backend: open"
+        );
         Ok(LocalFile {
             path,
             file: Mutex::new(file),
@@ -129,6 +140,12 @@ impl fmt::Debug for LocalFile {
         f.debug_struct("LocalFile")
             .field("path", &self.path)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LocalFile {
+    fn drop(&mut self) {
+        tracing::info!(path = %self.path.display(), "local backend: close");
     }
 }
 
@@ -265,6 +282,12 @@ impl LocalFile {
     /// thread, which is why the entry point is explicit rather than part of
     /// the async `write_at` path.
     pub fn write_at_sync_pwrite(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        tracing::info!(
+            path = %self.path.display(),
+            offset,
+            len = buf.len(),
+            "local backend: write_at_sync_pwrite"
+        );
         #[cfg(test)]
         self.write_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -380,6 +403,13 @@ impl LocalFile {
         if len == 0 {
             return Ok(Bytes::new());
         }
+        tracing::info!(
+            path = %self.path.display(),
+            offset,
+            len,
+            mode = if self.direct_io { "direct" } else { "buffered" },
+            "local backend: read_at"
+        );
         if self.direct_io {
             return self.read_direct_at(submitter, offset, len).await;
         }
@@ -394,6 +424,13 @@ impl LocalFile {
         if dst.is_empty() {
             return Ok(0);
         }
+        tracing::info!(
+            path = %self.path.display(),
+            offset,
+            len = dst.len(),
+            mode = if self.direct_io { "direct" } else { "buffered" },
+            "local backend: read_at_into"
+        );
         let fd = self.raw_fd().await;
 
         if self.direct_io {
@@ -427,6 +464,13 @@ impl LocalFile {
         if buf.is_empty() {
             return Ok(0);
         }
+        tracing::info!(
+            path = %self.path.display(),
+            offset,
+            len = buf.len(),
+            mode = self.write_mode(buf.len()),
+            "local backend: write_at"
+        );
         if self.direct_io {
             return self.write_direct_at(submitter, offset, buf).await;
         }
@@ -442,11 +486,30 @@ impl LocalFile {
         if data.is_empty() {
             return Ok(0);
         }
+        tracing::info!(
+            path = %self.path.display(),
+            offset,
+            len = data.len(),
+            mode = self.write_mode(data.len()),
+            "local backend: write_bytes_at"
+        );
         if self.direct_io {
             return self.write_direct_at(submitter, offset, data).await;
         }
 
         self.write_buffered_at(submitter, offset, data).await
+    }
+
+    /// Label identifying which write sub-path a write of `len` bytes will
+    /// take; used only for trace logging.
+    fn write_mode(&self, len: usize) -> &'static str {
+        if self.direct_io {
+            "direct"
+        } else if len <= BUFFERED_PWRITE_FAST_PATH_MAX {
+            "sync_pwrite"
+        } else {
+            "uring_buffered"
+        }
     }
 
     async fn write_buffered_at<S>(&self, submitter: &S, offset: u64, buf: &[u8]) -> Result<usize>
@@ -528,16 +591,20 @@ impl VirtualFile for LocalFile {
 
     async fn size(&self) -> Result<u64> {
         let file = self.file.lock().await;
-        Ok(file.metadata().await?.len())
+        let size = file.metadata().await?.len();
+        tracing::info!(path = %self.path.display(), size, "local backend: size");
+        Ok(size)
     }
 
     async fn truncate(&self, size: u64) -> Result<()> {
+        tracing::info!(path = %self.path.display(), size, "local backend: truncate");
         let file = self.file.lock().await;
         file.set_len(size).await?;
         Ok(())
     }
 
     async fn sync(&self) -> Result<()> {
+        tracing::info!(path = %self.path.display(), "local backend: sync");
         let file = self.file.lock().await;
         file.sync_all().await?;
         Ok(())
@@ -551,12 +618,14 @@ impl VirtualFile for LocalFile {
         if result < 0 {
             let err = Errno::last();
             if err == Errno::ENXIO {
+                tracing::info!(path = %self.path.display(), offset, result = ?None::<u64>, "local backend: seek_data");
                 return Ok(None);
             }
             return Err(err.into());
         }
         let val = u64::try_from(result)
             .context(format!("seek_data returned negative offset {result}"))?;
+        tracing::info!(path = %self.path.display(), offset, result = ?Some(val), "local backend: seek_data");
         Ok(Some(val))
     }
 
@@ -568,12 +637,14 @@ impl VirtualFile for LocalFile {
         if result < 0 {
             let err = Errno::last();
             if err == Errno::ENXIO {
+                tracing::info!(path = %self.path.display(), offset, result = ?None::<u64>, "local backend: seek_hole");
                 return Ok(None);
             }
             return Err(err.into());
         }
         let val = u64::try_from(result)
             .context(format!("seek_hole returned negative offset {result}"))?;
+        tracing::info!(path = %self.path.display(), offset, result = ?Some(val), "local backend: seek_hole");
         Ok(Some(val))
     }
 
@@ -581,21 +652,25 @@ impl VirtualFile for LocalFile {
         if len == 0 {
             return Ok(());
         }
+        tracing::info!(path = %self.path.display(), offset, len, "local backend: discard (punch hole)");
         let file = self.file.lock().await;
         Self::punch_hole_keep_size(file.as_raw_fd(), offset, len)
     }
 
     async fn evict_range(&self, offset: u64, len: u64) -> Result<()> {
+        tracing::info!(path = %self.path.display(), offset, len, "local backend: evict_range (fadvise DONTNEED)");
         let file = self.file.lock().await;
         Self::posix_fadvise_dontneed(file.as_raw_fd(), offset, len)
     }
 
     async fn evict_all(&self) -> Result<()> {
+        tracing::info!(path = %self.path.display(), "local backend: evict_all (fadvise DONTNEED)");
         let file = self.file.lock().await;
         Self::posix_fadvise_dontneed(file.as_raw_fd(), 0, 0)
     }
 
     async fn fgetxattr(&self, name: &str) -> Result<Vec<u8>> {
+        tracing::info!(path = %self.path.display(), name, "local backend: fgetxattr");
         let cname = CString::new(name).context("xattr name contains interior NUL byte")?;
         let file = self.file.lock().await;
         let fd = file.as_raw_fd();
@@ -625,6 +700,7 @@ impl VirtualFile for LocalFile {
     }
 
     async fn flistxattr(&self) -> Result<Vec<String>> {
+        tracing::info!(path = %self.path.display(), "local backend: flistxattr");
         let file = self.file.lock().await;
         let fd = file.as_raw_fd();
 
@@ -654,6 +730,7 @@ impl VirtualFile for LocalFile {
     }
 
     async fn fsetxattr(&self, name: &str, value: &[u8], flags: i32) -> Result<()> {
+        tracing::info!(path = %self.path.display(), name, value_len = value.len(), flags, "local backend: fsetxattr");
         let cname = CString::new(name).context("xattr name contains interior NUL byte")?;
         let file = self.file.lock().await;
         let fd = file.as_raw_fd();
@@ -674,6 +751,7 @@ impl VirtualFile for LocalFile {
     }
 
     async fn fremovexattr(&self, name: &str) -> Result<()> {
+        tracing::info!(path = %self.path.display(), name, "local backend: fremovexattr");
         let cname = CString::new(name).context("xattr name contains interior NUL byte")?;
         let file = self.file.lock().await;
         let fd = file.as_raw_fd();
