@@ -6,7 +6,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
-const DEFAULT_FILTER: &str = "agentenv=info,envd=info,uvm_ublk=info";
+const DEFAULT_FILTER: &str = "agentenv=info,envd=info,uvm_ublk=info,overlaybd=info";
 const LOG_FORMAT_ENV: &str = "AENV_LOG_FORMAT";
 const LOG_SPAN_EVENTS_ENV: &str = "AENV_LOG_SPAN_EVENTS";
 

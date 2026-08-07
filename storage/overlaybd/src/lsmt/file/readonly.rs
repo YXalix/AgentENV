@@ -236,6 +236,7 @@ impl LSMTReadOnlyFile {
         let mut curr_offset = offset;
         let mut buf_pos = 0;
         let max_io_size = self.max_io_size.load(Ordering::Acquire);
+        let mut classify = ReadClassify::default();
 
         while remaining > 0 {
             let step = min(remaining, max_io_size);
@@ -259,6 +260,7 @@ impl LSMTReadOnlyFile {
                     let fill_len = min(hole_bytes, step.saturating_sub(local_buf_pos - buf_pos));
                     if fill_len > 0 {
                         buf[local_buf_pos..local_buf_pos + fill_len].fill(0);
+                        classify.hole_bytes += fill_len as u64;
                     }
                     current_blk = m.offset();
                 }
@@ -287,6 +289,7 @@ impl LSMTReadOnlyFile {
 
                 if m.zeroed {
                     buf[local_buf_pos..local_buf_pos + actual_copy_len].fill(0);
+                    classify.zeroed_bytes += actual_copy_len as u64;
                 } else {
                     let phys_offset = m.moffset * ALIGNMENT;
                     let layer_idx = m.tag as usize;
@@ -299,6 +302,8 @@ impl LSMTReadOnlyFile {
                             &mut buf[local_buf_pos..local_buf_pos + actual_copy_len],
                         )
                         .await?;
+                        classify.physical_bytes += actual_copy_len as u64;
+                        classify.physical_ops += 1;
                     } else {
                         bail!("Layer index {} out of range", layer_idx);
                     }
@@ -310,6 +315,7 @@ impl LSMTReadOnlyFile {
                 let local_buf_pos = buf_pos + ((current_blk - begin_blk) * ALIGNMENT) as usize;
                 if local_buf_pos - buf_pos < step {
                     buf[local_buf_pos..buf_pos + step].fill(0);
+                    classify.hole_bytes += (buf_pos + step - local_buf_pos) as u64;
                 }
             }
 
@@ -317,6 +323,19 @@ impl LSMTReadOnlyFile {
             curr_offset += step as u64;
             buf_pos += step;
         }
+
+        tracing::info!(
+            target: "overlaybd::read_classify",
+            file_type = ?self.file_type(),
+            offset,
+            read_len,
+            hole_bytes = classify.hole_bytes,
+            zeroed_bytes = classify.zeroed_bytes,
+            physical_bytes = classify.physical_bytes,
+            physical_ops = classify.physical_ops,
+            all_zero = classify.physical_bytes == 0,
+            "lsmt read classify"
+        );
 
         Ok(read_len)
     }

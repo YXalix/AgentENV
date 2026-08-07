@@ -215,6 +215,22 @@ pub struct DataStat {
     pub valid_data_size: u64,
 }
 
+/// Per-read byte classification used by the debug tracing in the LSMT read
+/// path. Counted in the caller's buffer space over a single logical read:
+/// - `hole_bytes`: virtual ranges with no index mapping (zero-filled).
+/// - `zeroed_bytes`: explicit `zeroed` mappings (zero-filled, no physical IO).
+/// - `physical_bytes`: bytes actually read from a backing `VirtualFile`.
+/// - `physical_ops`: number of distinct backing-file reads issued.
+///
+/// If `physical_bytes == 0` after a read, the entire range was served as zeros.
+#[derive(Default)]
+pub(super) struct ReadClassify {
+    pub(super) hole_bytes: u64,
+    pub(super) zeroed_bytes: u64,
+    pub(super) physical_bytes: u64,
+    pub(super) physical_ops: u64,
+}
+
 pub struct CommitArgs {
     pub writer: Arc<dyn CompactWriter>,
     pub user_tag: Option<Vec<u8>>,

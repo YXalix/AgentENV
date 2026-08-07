@@ -1066,6 +1066,7 @@ impl LSMTFile {
         let mut curr_offset = offset;
         let mut buf_pos = 0;
         let max_io_size = self.max_io_size.load(Ordering::Acquire);
+        let mut classify = ReadClassify::default();
 
         while remaining > 0 {
             let step = min(remaining, max_io_size);
@@ -1088,7 +1089,7 @@ impl LSMTFile {
                 // upper data. Hybrid in-place writes hold the write lock while
                 // mutating that data, so this prevents torn reads.
                 self.read_mappings_into_generic(
-                    reader, mappings, begin_blk, count_blk, step, buf_pos, buf,
+                    reader, mappings, begin_blk, count_blk, step, buf_pos, buf, &mut classify,
                 )
                 .await?;
             } else {
@@ -1097,7 +1098,7 @@ impl LSMTFile {
                     idx.lookup(query, &mut mappings);
                 }
                 self.read_mappings_into_generic(
-                    reader, mappings, begin_blk, count_blk, step, buf_pos, buf,
+                    reader, mappings, begin_blk, count_blk, step, buf_pos, buf, &mut classify,
                 )
                 .await?;
             }
@@ -1106,6 +1107,19 @@ impl LSMTFile {
             curr_offset += step as u64;
             buf_pos += step;
         }
+
+        tracing::info!(
+            target: "overlaybd::read_classify",
+            file_type = ?self.file_type(),
+            offset,
+            read_len,
+            hole_bytes = classify.hole_bytes,
+            zeroed_bytes = classify.zeroed_bytes,
+            physical_bytes = classify.physical_bytes,
+            physical_ops = classify.physical_ops,
+            all_zero = classify.physical_bytes == 0,
+            "lsmt read classify"
+        );
 
         Ok(read_len)
     }
@@ -1120,6 +1134,7 @@ impl LSMTFile {
         step: usize,
         buf_pos: usize,
         buf: &mut [u8],
+        classify: &mut ReadClassify,
     ) -> Result<()> {
         let mut current_blk = begin_blk;
         let end_blk = begin_blk + count_blk;
@@ -1133,6 +1148,7 @@ impl LSMTFile {
                 let fill_len = min(hole_bytes, step.saturating_sub(local_buf_pos - buf_pos));
                 if fill_len > 0 {
                     buf[local_buf_pos..local_buf_pos + fill_len].fill(0);
+                    classify.hole_bytes += fill_len as u64;
                 }
                 current_blk = m.offset();
             }
@@ -1162,6 +1178,7 @@ impl LSMTFile {
 
             if m.zeroed {
                 buf[local_buf_pos..local_buf_pos + actual_read_len].fill(0);
+                classify.zeroed_bytes += actual_read_len as u64;
             } else {
                 let phys_offset = m.moffset * ALIGNMENT;
                 let layer_idx = m.tag as usize;
@@ -1174,6 +1191,8 @@ impl LSMTFile {
                         &mut buf[local_buf_pos..local_buf_pos + actual_read_len],
                     )
                     .await?;
+                    classify.physical_bytes += actual_read_len as u64;
+                    classify.physical_ops += 1;
                 } else {
                     bail!("Invalid layer tag {}", layer_idx);
                 }
@@ -1185,6 +1204,7 @@ impl LSMTFile {
             let local_buf_pos = buf_pos + ((current_blk - begin_blk) * ALIGNMENT) as usize;
             if local_buf_pos - buf_pos < step {
                 buf[local_buf_pos..buf_pos + step].fill(0);
+                classify.hole_bytes += (buf_pos + step - local_buf_pos) as u64;
             }
         }
 
