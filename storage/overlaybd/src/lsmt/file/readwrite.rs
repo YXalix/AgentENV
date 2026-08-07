@@ -9,6 +9,7 @@ use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
+use tracing::info;
 use uuid::Uuid;
 use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, IntoBytes};
@@ -99,11 +100,24 @@ impl LSMTFile {
         let rw_uuid = parse_uuid_field(&header.uuid).unwrap_or_else(Uuid::nil);
         uuids.push(rw_uuid);
 
+        info!(
+            data_file_size,
+            ?rw_layout,
+            rw_tag,
+            virtual_size = header.virtual_size.get(),
+            uuid = %rw_uuid,
+            "opening LSMT rw data file"
+        );
+
         let mut mutable_index = MutableIndex::new();
         let mut rw_index_append_offset = HEADER_SIZE;
 
         if rw_layout == RwLayout::Sparse {
             let mappings = create_mappings_from_sparse(&rw_data_file, HEADER_SIZE).await?;
+            info!(
+                mappings = mappings.len(),
+                "rebuilt LSMT index from sparse data file"
+            );
             for m in mappings {
                 mutable_index.insert(m);
             }
@@ -124,6 +138,12 @@ impl LSMTFile {
                 let count = mapping_area_size / stride;
                 let mappings =
                     load_index_and_reset_tags(idx_file, HEADER_SIZE, count as usize).await?;
+                info!(
+                    records = count,
+                    loaded = mappings.len(),
+                    index_file_size = idx_file_size,
+                    "loaded LSMT rw index file into mutable index"
+                );
 
                 for m in mappings {
                     mutable_index.insert(m);
@@ -133,7 +153,15 @@ impl LSMTFile {
             bail!("missing index file for non-sparse LSMT open");
         }
 
+        let has_lower_index = lower_index.is_some();
         let combo_index = ComboIndex::new(mutable_index, lower_index, rw_tag as u8);
+        info!(
+            rw_tag,
+            has_lower_index,
+            upper_mappings = combo_index.upper_len(),
+            rw_index_append_offset,
+            "LSMT combo index initialized"
+        );
         let file_type = rw_layout.file_type();
         let append_digest = Self::initial_append_digest(&rw_data_file, file_type, data_file_size)
             .await
@@ -216,6 +244,14 @@ impl LSMTFile {
         let mutable_index = MutableIndex::new();
         let rw_tag = 0;
         let combo_index = ComboIndex::new(mutable_index, None, 0);
+
+        info!(
+            ?rw_layout,
+            virtual_size,
+            %uuid,
+            has_index_file = rw_index_file.is_some(),
+            "created LSMT rw file with fresh index"
+        );
 
         let file_type = rw_layout.file_type();
         let append_digest = Self::initial_append_digest(&rw_data_file, file_type, HEADER_SIZE)

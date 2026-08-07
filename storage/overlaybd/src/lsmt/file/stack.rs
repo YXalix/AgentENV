@@ -7,6 +7,7 @@ use futures_util::stream::{self, StreamExt};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::io::virtual_file::VirtualFile;
@@ -137,6 +138,13 @@ fn build_readonly_stack_from_merged(
     ro_layers.reverse();
     uuids.reverse();
 
+    info!(
+        layers = ro_layers.len(),
+        merged_mappings = merged.mappings().len(),
+        virtual_size,
+        "opened readonly LSMT layer stack"
+    );
+
     Ok(LSMTReadOnlyFile::from_merged_layers(
         ro_layers,
         merged,
@@ -170,6 +178,10 @@ pub async fn open_files_ro_with_premerged_cache(
 
     let metadata = load_readonly_layers_metadata(files).await?;
     let Some(key) = PremergedIndexCacheKey::from_metadata(&metadata) else {
+        info!(
+            layers = files.len(),
+            "premerged index cache key unavailable; merging layer indexes directly"
+        );
         let merged = merge_readonly_indexes(files, &metadata).await?;
         return build_readonly_stack_from_merged(files, &metadata, merged);
     };
@@ -192,6 +204,11 @@ pub async fn open_files_ro_with_premerged_cache(
         }
     }
 
+    info!(
+        digest = %key.digest_hex,
+        layers = files.len(),
+        "premerged index cache miss; merging layer indexes"
+    );
     let merged = match merge_readonly_indexes(files, &metadata).await {
         Ok(merged) => merged,
         Err(err) => {
@@ -202,6 +219,11 @@ pub async fn open_files_ro_with_premerged_cache(
     };
 
     if policy.write {
+        info!(
+            digest = %key.digest_hex,
+            mappings = merged.mappings().len(),
+            "spawning premerged index artifact write"
+        );
         spawn_premerged_index_artifact_write(
             cache_dir.clone(),
             key.clone(),

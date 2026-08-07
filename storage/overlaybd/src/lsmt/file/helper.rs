@@ -550,6 +550,14 @@ async fn write_premerged_index_artifact(
         });
     }
 
+    tracing::info!(
+        path = %path.display(),
+        digest = %key.digest_hex,
+        mappings = index.mappings().len(),
+        bytes = artifact.len(),
+        "wrote premerged index artifact"
+    );
+
     Ok(())
 }
 
@@ -560,7 +568,15 @@ pub(super) async fn try_read_premerged_index_artifact(
     let artifact_path = key.artifact_path(cache_dir);
     match tokio::fs::read(&artifact_path).await {
         Ok(bytes) => match decode_premerged_index_artifact(&bytes, key) {
-            Ok(merged) => Some(merged),
+            Ok(merged) => {
+                tracing::info!(
+                    path = %artifact_path.display(),
+                    digest = %key.digest_hex,
+                    mappings = merged.mappings().len(),
+                    "premerged index cache hit"
+                );
+                Some(merged)
+            }
             Err(err) => {
                 tracing::warn!(
                     ?err,
@@ -904,6 +920,15 @@ async fn load_index(
         }
         mappings.push(m);
     }
+
+    tracing::info!(
+        offset,
+        records = count,
+        loaded = mappings.len(),
+        skipped = count - mappings.len(),
+        reset_tag,
+        "loaded LSMT index mappings"
+    );
 
     Ok(mappings)
 }

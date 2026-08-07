@@ -6,6 +6,7 @@ use bytes::{Bytes, BytesMut};
 use std::cmp::min;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::io::vfile_io::{read_exact, CtxRead, DirectRead, FileReader};
@@ -40,6 +41,15 @@ impl LSMTReadOnlyFile {
 
         let index = Arc::new(ReadOnlyIndex::new(mappings));
         let uuid = parse_uuid_field(&trailer.uuid).unwrap_or_else(Uuid::nil);
+
+        info!(
+            index_offset = trailer.index_offset.get(),
+            index_size = trailer.index_size.get(),
+            mappings = index.mappings().len(),
+            virtual_size = trailer.virtual_size.get(),
+            %uuid,
+            "loaded readonly LSMT layer index"
+        );
 
         Ok(Self {
             index: index.clone(),

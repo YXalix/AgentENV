@@ -202,7 +202,14 @@ impl ReadOnlyIndex {
             }
         }
 
-        ReadOnlyIndex::new(mi.dump())
+        let merged = mi.dump();
+        tracing::info!(
+            input_indexes = indexes.len(),
+            input_mappings = indexes.iter().map(|idx| idx.mappings.len()).sum::<usize>(),
+            merged_mappings = merged.len(),
+            "merged readonly LSMT indexes"
+        );
+        ReadOnlyIndex::new(merged)
     }
 
     pub fn mappings(&self) -> &[SegmentMapping] {
