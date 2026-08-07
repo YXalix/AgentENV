@@ -275,6 +275,16 @@ impl LSMTReadOnlyFile {
                 let chunk_bytes = (m.length() as u64 * ALIGNMENT) as usize;
                 let actual_copy_len = min(chunk_bytes, step - (local_buf_pos - buf_pos));
 
+                tracing::info!(
+                    target: "overlaybd::flow",
+                    layer_tag = m.tag,
+                    virt_blk = m.offset(),
+                    phys_off = m.moffset * ALIGNMENT,
+                    len = actual_copy_len,
+                    zeroed = m.zeroed,
+                    "lsmt segment dispatch"
+                );
+
                 if m.zeroed {
                     buf[local_buf_pos..local_buf_pos + actual_copy_len].fill(0);
                 } else {
