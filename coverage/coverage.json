@@ -5,21 +5,21 @@
     "total": 0
   },
   "functions": {
-    "coverage": "72.15%",
-    "missed": 1375,
-    "total": 4937
+    "coverage": "72.51%",
+    "missed": 1370,
+    "total": 4983
   },
-  "generated_at": "2026-08-06T08:50:40Z",
+  "generated_at": "2026-08-10T01:24:06Z",
   "lines": {
-    "coverage": "76.26%",
-    "missed": 9664,
-    "total": 40705
+    "coverage": "77.00%",
+    "missed": 9455,
+    "total": 41111
   },
   "package": "workspace",
   "regions": {
-    "coverage": "75.37%",
-    "missed": 14019,
-    "total": 56927
+    "coverage": "76.15%",
+    "missed": 13763,
+    "total": 57708
   },
-  "run_url": "https://github.com/YXalix/AgentENV/actions/runs/31084836352"
+  "run_url": "https://github.com/YXalix/AgentENV/actions/runs/31346740129"
 }
