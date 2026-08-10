@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e7e0841d.js";
+            window.path_to_searchindex_js = "searchindex-57a597c0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-795efd7f.js"></script>
@@ -225,7 +225,7 @@ The repository is available at <a href="https://github.com/kvcache-ai/AgentENV">
 <h1 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h1>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <ul>
-<li><strong>Linux kernel 6.8+</strong>; the install script additionally requires <strong>Ubuntu 24.04</strong></li>
+<li><strong>Linux kernel 6.8+</strong></li>
 <li><code>/dev/kvm</code> access for Firecracker microVM execution</li>
 </ul>
 <blockquote>
@@ -240,7 +240,7 @@ uses a dedicated <code>aenv</code> system account with <code>CAP_NET_ADMIN</code
 <code>CAP_SYS_ADMIN</code>, plus group access to <code>/dev/kvm</code> and the ublk devices.</p>
 <h2 id="setup"><a class="header" href="#setup">Setup</a></h2>
 <h3 id="1-install-and-start-the-server"><a class="header" href="#1-install-and-start-the-server">1. Install and start the server</a></h3>
-<p><strong>Option A — Install Script (Ubuntu 24.04)</strong></p>
+<p><strong>Option A — Install Script</strong></p>
 <p>The script installs both the server and the <code>aenv</code> CLI. Set <code>AENV_HOME_PATH</code> to
 choose the data directory; if it is not set, AENV stores runtime dependencies
 and data in <code>/var/lib/aenv</code>. After installation, start the server as a systemd
@@ -1277,6 +1277,7 @@ make start-server
 <pre><code class="language-toml">virtualization_mode = "pvm"
 </code></pre>
 <p>The environment variable takes precedence over the TOML value.</p>
+<p>Memory snapshot dirty-page tracking (<code>memory_snapshot.track_dirty_pages = true</code>) is temporarily disabled in PVM mode because this combination has not been tested.</p>
 <p>To build a PVM Docker image:</p>
 <pre><code class="language-bash">docker build \
   --build-arg AENV_VIRTUALIZATION_MODE=pvm \
@@ -1887,19 +1888,17 @@ host sysctls; otherwise configure these kernel parameters on the host.</p>
 </table>
 </div>
 <h2 id="ublk"><a class="header" href="#ublk"><code>[ublk]</code></a></h2>
-<p>Optional userspace block device configuration. When enabled, rootfs is served through a ublk device instead of a plain file, managed by <code>uvm-ublk-daemon</code>.</p>
+<p>Userspace block device configuration. Rootfs is served through an OverlayBD-backed ublk device managed by <code>uvm-ublk-daemon</code>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable ublk-backed rootfs</td></tr>
 <tr><td><code>daemon_binary_path</code></td><td>string</td><td><code>"$AENV_HOME/ublk/uvm-ublk-daemon"</code></td><td>Path to the <code>uvm-ublk-daemon</code> binary</td></tr>
 <tr><td><code>daemon_socket_path</code></td><td>string</td><td><code>"$AENV_RUNTIME/ublk-daemon.sock"</code></td><td>Unix socket path used by the daemon</td></tr>
 <tr><td><code>daemon_log_path</code></td><td>string</td><td><code>"$AENV_HOME/logs/ublk-daemon.log"</code></td><td>File path for daemon logs; deployments are responsible for rotation and retention</td></tr>
 <tr><td><code>daemon_metrics_listen_addr</code></td><td>string</td><td><code>"0.0.0.0:9103"</code></td><td>HTTP listen address for daemon Prometheus metrics; empty string disables it</td></tr>
-<tr><td><code>device_type</code></td><td>string</td><td><code>"overlaybd"</code></td><td><code>"cow"</code> (copy-on-write) or <code>"overlaybd"</code> (layered image)</td></tr>
 </tbody>
 </table>
 </div>
@@ -1909,7 +1908,7 @@ host sysctls; otherwise configure these kernel parameters on the host.</p>
 <li><code>AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR</code></li>
 </ul>
 <h2 id="ublkoverlaybd"><a class="header" href="#ublkoverlaybd"><code>[ublk.overlaybd]</code></a></h2>
-<p>Overlaybd-specific configuration used when <code>ublk.device_type = "overlaybd"</code>.</p>
+<p>OverlayBD configuration for ublk. Legacy <code>enabled</code> and <code>device_type</code> keys are ignored.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -1950,6 +1949,7 @@ the default path on every startup.</p>
 <tbody>
 <tr><td><code>overlaybd_global_config_path</code></td><td>string</td><td><code>"$AENV_HOME/overlaybd/mem-overlaybd-global.json"</code></td><td>Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file.</td></tr>
 <tr><td><code>direct_overlaybd</code></td><td>bool</td><td><code>true</code></td><td>Create memory overlaybd layers directly from Firecracker dirty memory ranges via <code>process_vm_readv</code>, skipping the intermediate <code>mem.bin</code> file. Set <code>AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD=false</code> to force the legacy <code>mem.bin</code> conversion path.</td></tr>
+<tr><td><code>track_dirty_pages</code></td><td>bool</td><td><code>false</code></td><td>Enable Firecracker KVM dirty-page tracking for memory snapshots. When true, <code>direct_overlaybd</code> must also be <code>true</code>; PVM is temporarily disabled because this combination has not been tested. Set <code>AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true</code> to enable it.</td></tr>
 <tr><td><code>compression_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable compression for memory snapshot layers. When disabled, <code>compression_algorithm</code> is still parsed but has no effect. This setting affects only memory layers; the physical file name remains <code>overlaybd.commit</code>.</td></tr>
 <tr><td><code>compression_algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm for memory snapshot layers. Valid values are only <code>lz4</code> and <code>zstd</code>.</td></tr>
 </tbody>
@@ -3012,7 +3012,7 @@ by path when needed:</p>
 <p><strong>Snapshot</strong>: <code>ImageFile::create_snapshot_and_restack()</code> is the primary pause path. It seals the live upper layer via <code>LSMTFile::close_seal_and_reopen()</code> so the upper becomes the newest lower layer, then reopens a fresh writable upper in place. <code>image/snapshot.rs::export_upper_as_snapshot_layer()</code> retains the explicit upper-export path used by packaging and export flows.</p>
 <p><strong>Key files</strong>: <code>image/image_file.rs</code> (high-level image), <code>lsmt/file/</code> (LSMT stacking: <code>readonly.rs</code> for <code>LSMTReadOnlyFile</code>, <code>readwrite.rs</code> for <code>LSMTFile</code>, <code>stack.rs</code> for open/merge/stack helpers), <code>lsmt/format.rs</code> (binary format), <code>lsmt/index.rs</code> (segment mapping), <code>compression/zfile.rs</code> (compression), <code>image/snapshot.rs</code>.</p>
 <h3 id="ublk-storageublk"><a class="header" href="#ublk-storageublk">ublk (<code>storage/ublk/</code>)</a></h3>
-<p>Async userspace block device server using Linux’s ublk kernel driver. Exposes overlaybd images (or raw CoW files) as <code>/dev/ublkbN</code> block devices.</p>
+<p>Async userspace block device server using Linux’s ublk kernel driver. Exposes OverlayBD images as <code>/dev/ublkbN</code> block devices.</p>
 <p><strong>Device lifecycle</strong>:</p>
 <ol>
 <li><code>UVMUblkCtrlBuilder</code> sends <code>ADD</code> to <code>/dev/ublk-control</code> via io_uring <code>UringCmd</code></li>
@@ -3021,17 +3021,16 @@ by path when needed:</p>
 <li>Kernel dispatches block I/O to mmap’d <code>ublksrv_io_desc</code> arrays; userspace processes them asynchronously</li>
 <li><code>delete_dev()</code> tears down the device</li>
 </ol>
-<p><strong>Target implementations</strong> (<code>UVMUblkTarget</code> trait):</p>
+<p><strong>Target implementation</strong> (<code>UVMUblkTarget</code> trait):</p>
 <ul>
 <li><code>OverlaybdTarget</code>: wraps <code>ImageFile</code> for full layered image I/O</li>
-<li><code>BasicCowTarget</code>: chunk-based copy-on-write over a read-only origin file. Per-chunk <code>AtomicU8</code> state tracking (Origin -&gt; Copying -&gt; Cow) prevents duplicate copies. Coalesces adjacent reads.</li>
 </ul>
 <p><strong>I/O buffers</strong>: <code>AutoRegBuffer</code> (zero-copy via sparse buffer table, kernel 6.8+) or <code>UserBuffer</code> (traditional allocation).</p>
-<p><strong>Key files</strong>: <code>lib.rs</code> (public API), <code>ctrl.rs</code> (device controller), <code>dev.rs</code> (device + queue management), <code>queue.rs</code> (I/O descriptor handling), <code>io_buffer.rs</code>, <code>impls/cow.rs</code>, <code>impls/overlaybd_target.rs</code>.</p>
+<p><strong>Key files</strong>: <code>lib.rs</code> (public API), <code>ctrl.rs</code> (device controller), <code>dev.rs</code> (device + queue management), <code>queue.rs</code> (I/O descriptor handling), <code>io_buffer.rs</code>, <code>impls/overlaybd_target.rs</code>.</p>
 <h3 id="ublk-daemon-storageublk-daemon"><a class="header" href="#ublk-daemon-storageublk-daemon">ublk-daemon (<code>storage/ublk-daemon/</code>)</a></h3>
 <p>Long-running daemon process (<code>uvm-ublk-daemon</code>) that manages all ublk devices in one process and communicates with the AgentENV node over a Unix domain socket.</p>
 <ul>
-<li>Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD/COW device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.</li>
+<li>Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.</li>
 <li><code>UblkDaemonClient</code> spawns and monitors the daemon process from the node runtime.</li>
 <li><code>UblkDeviceManager</code> (<code>src/sandbox/ublk/device.rs</code>) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.</li>
 </ul>
@@ -3195,7 +3194,6 @@ at render/apply time so AgentENV runtime config remains single-sourced.</p>
 │   ├── queue.rs                # I/O descriptor handling
 │   ├── io_buffer.rs            # zero-copy + traditional buffers
 │   └── impls/                  # target implementations
-│       ├── cow.rs              # BasicCowTarget
 │       └── overlaybd_target.rs # OverlaybdTarget
 ├── ublk-daemon/src/            # ublk daemon (unix socket RPC)
 │   ├── client.rs               # daemon client used by node runtime
@@ -3632,18 +3630,16 @@ ready after VM start (default: 30).</li>
 <li>
 <p><code>[ublk]</code></p>
 <ul>
-<li><code>enabled</code>: Enables ublk-backed rootfs handling.</li>
 <li><code>daemon_binary_path</code>: Optional path to <code>uvm-ublk-daemon</code>.</li>
 <li><code>daemon_socket_path</code>: Optional unix socket path for daemon RPCs.</li>
 <li><code>daemon_log_path</code>: Optional log file path for the daemon process.</li>
-<li><code>device_type</code>: <code>cow</code> or <code>overlaybd</code>.</li>
 </ul>
 </li>
 <li>
 <p><code>[ublk.overlaybd]</code></p>
 <ul>
 <li><code>global_config_path</code>: path to the generated overlaybd runtime config.
-Required for <code>overlaybd</code> device_type. Per-image configs are derived from
+Required for ublk. Per-image configs are derived from
 template build <code>fromImage</code> values and live under
 <code>&lt;image.cache.root_dir&gt;/configs</code>.</li>
 </ul>
@@ -4272,7 +4268,7 @@ network namespaces are missing</li>
 <tr><td><code>persisted_sandbox_store_path</code></td><td><code>$AENV_HOME/persisted-sandboxes</code></td><td><code>src/orchestrator/persistence/*</code></td><td>Durable paused sandbox records and artifacts.</td></tr>
 <tr><td><code>snapshot_store</code></td><td><code>$AENV_HOME/snapshot-store</code></td><td><code>src/snapshot/repository/*</code></td><td>Durable committed snapshot repository root. The configured backend uses <code>&lt;snapshot_store&gt;/repository</code>. Relative explicit paths are resolved against the config file directory.</td></tr>
 <tr><td><code>snapshot.local_cache_path</code></td><td><code>$AENV_HOME/snapshot-local-cache</code></td><td><code>src/snapshot/artifact_cache.rs</code>, runtime resolvers</td><td>Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory.</td></tr>
-<tr><td><code>image.cache.root_dir</code></td><td><code>$AENV_HOME/image-cache</code></td><td><code>src/image/*</code>, overlaybd runtime</td><td>Node-local image cache root. Contains <code>configs/</code>, <code>indexes/</code>, <code>commits/</code>, and <code>remote-blocks/</code>.</td></tr>
+<tr><td><code>image.cache.root_dir</code></td><td><code>$AENV_HOME/image-cache</code></td><td><code>src/image/*</code>, overlaybd runtime</td><td>Node-local image cache root. Contains <code>configs/</code>, <code>indexes/</code>, <code>commits/</code>, and <code>remote-blocks/</code>. The offline C++ tools own isolated sibling cache roots: <code>convert-blocks/</code> (<code>overlaybd-apply</code>) and <code>resize-blocks/</code> (<code>overlaybd-resize</code>).</td></tr>
 <tr><td><code>p2p.store_dir</code></td><td><code>$AENV_HOME/p2p/store</code></td><td><code>src/p2p/*</code>, <code>src/cfg.rs</code></td><td>Local store for P2P artifact transport backends. Relative explicit paths are resolved against the config file directory.</td></tr>
 <tr><td><code>image.cache.remote_blocks</code></td><td><code>&lt;image.cache.root_dir&gt;/remote-blocks</code></td><td>overlaybd runtime config</td><td>Remote block cache root. Overlaybd also stores <code>premerged-index/</code> under this cache dir. Its size limit comes from <code>image.cache.remote_blocks.max_size_gb</code>.</td></tr>
 <tr><td><code>ublk.daemon_socket_path</code></td><td><code>$AENV_RUNTIME/ublk-daemon.sock</code></td><td><code>src/sandbox/ublk/*</code>, <code>storage/ublk-daemon/*</code></td><td>Unix socket used for server-to-daemon IPC.</td></tr>
@@ -4292,11 +4288,11 @@ network namespaces are missing</li>
 <tr><td>CPU template helper</td><td><code>&lt;deps_path&gt;/firecracker/{version}/cpu-template-helper</code></td><td>Optional Firecracker helper executable</td><td>Detects host CPU config for cluster-wide CPU intersection</td><td>Extracted from Firecracker package when present.</td></tr>
 <tr><td>Kernel image</td><td><code>&lt;deps_path&gt;/kernel/{version}/vmlinux.bin</code></td><td>Guest kernel</td><td>VM boot source</td><td>Downloaded during setup. Old versions are retained until manually removed.</td></tr>
 <tr><td>Tools drive</td><td><code>&lt;deps_path&gt;/tools/{version}/tools.ext4</code></td><td>Read-only ext4 image with envd/tools</td><td>Firecracker root drive shared by sandboxes and pinned by snapshots through its immutable release version</td><td>Extracted from OCI or imported from <code>tools.drive_path</code> during setup. Old versions are retained until manually removed.</td></tr>
-<tr><td>Overlaybd tools</td><td><code>&lt;deps_path&gt;/overlaybd/bin/*</code>, <code>&lt;deps_path&gt;/overlaybd/lib/*</code></td><td><code>overlaybd-create</code>, <code>overlaybd-apply</code>, <code>overlaybd-commit</code>, <code>overlaybd-resize</code>, libraries</td><td>OCI-to-overlaybd conversion and packaging</td><td>Installed during setup when release metadata does not match.</td></tr>
+<tr><td>Overlaybd tools</td><td><code>&lt;deps_path&gt;/overlaybd/bin/*</code></td><td>Statically linked <code>overlaybd-create</code>, <code>overlaybd-apply</code>, <code>overlaybd-commit</code>, and <code>overlaybd-resize</code></td><td>OCI-to-overlaybd conversion and packaging</td><td>Installed during setup when release metadata does not match.</td></tr>
 <tr><td>Overlaybd release metadata</td><td><code>&lt;deps_path&gt;/overlaybd/tools-release.json</code></td><td>Installed overlaybd release identifier</td><td>Detects whether tools need reinstalling</td><td>Rewritten on setup when release changes.</td></tr>
-<tr><td>Overlaybd package downloads</td><td><code>&lt;deps_path&gt;/overlaybd/downloads/*</code></td><td>Downloaded package archives</td><td>Setup cache for overlaybd release packages</td><td>Kept after install; no automatic GC.</td></tr>
-<tr><td>Generated overlaybd config</td><td><code>$AENV_HOME/overlaybd/overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/mem-overlaybd-global.json</code></td><td>Runtime global config, cache path, credentials config</td><td>Configures overlaybd runtime and memory snapshot overlaybd access</td><td>Rewritten during setup/startup.</td></tr>
-<tr><td>Overlaybd runtime log</td><td><code>&lt;deps_path&gt;/overlaybd/overlaybd.log</code></td><td>Overlaybd runtime logs</td><td>Debugging</td><td>Appended by overlaybd runtime; no automatic GC.</td></tr>
+<tr><td>Overlaybd package downloads</td><td><code>&lt;deps_path&gt;/overlaybd/downloads/*</code></td><td>Temporary downloaded package archives</td><td>Setup staging for overlaybd release packages</td><td>Removed after a successful install.</td></tr>
+<tr><td>Generated overlaybd config</td><td><code>$AENV_HOME/overlaybd/overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/mem-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/convert-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/resize-overlaybd-global.json</code></td><td>Runtime global config, cache path, credentials config</td><td>Configures overlaybd runtime, memory snapshot overlaybd access, and the offline C++ tools (<code>overlaybd-apply</code>, <code>overlaybd-resize</code>), which get dedicated configs with isolated cacheDirs (<code>convert-blocks</code>, <code>resize-blocks</code>) and download disabled</td><td>Rewritten during setup/startup.</td></tr>
+<tr><td>Overlaybd runtime log</td><td><code>$AENV_HOME/overlaybd/overlaybd.log</code></td><td>Overlaybd runtime logs</td><td>Debugging</td><td>Appended by overlaybd runtime; no automatic GC.</td></tr>
 </tbody>
 </table>
 </div>
@@ -4462,6 +4458,7 @@ network namespaces are missing</li>
 </thead>
 <tbody>
 <tr><td>Remote block cache</td><td>configured <code>cacheConfig.cacheDir</code>, derived from <code>&lt;image.cache.root_dir&gt;/remote-blocks</code></td><td>Cached registryfs_v2 block ranges</td><td>Speeds remote overlaybd-native layer reads</td><td>Managed by overlaybd cache settings.</td><td>Yes.</td></tr>
+<tr><td>Offline C++ tool block caches</td><td><code>&lt;image.cache.root_dir&gt;/convert-blocks</code> (<code>overlaybd-apply</code>), <code>&lt;image.cache.root_dir&gt;/resize-blocks</code> (<code>overlaybd-resize</code>)</td><td>C++ file-cache entries for the offline tools</td><td>Keeps C++ cache eviction (truncate+unlink of flat cacheDir files) away from the Rust runtime cache’s per-entry directories</td><td>Owned and evicted by the C++ tools via their dedicated generated global configs; download is disabled in those configs. Never shared with the Rust runtime <code>remote-blocks</code> cache.</td><td>Yes.</td></tr>
 <tr><td>Premerged index cache</td><td><code>cacheConfig.cacheDir/premerged-index/*.pmidx</code></td><td>Serialized merged read-only lower index</td><td>Speeds opening repeated lower stacks</td><td>Written asynchronously on read-only open. Pruned by size limit derived from cache size.</td><td>Yes.</td></tr>
 <tr><td>Sealed overlaybd commit files</td><td>Various owner paths: image cache, snapshot dirs, repository managed layers</td><td>Overlaybd layer data and index trailer</td><td>Immutable lower layers for block devices and memory images</td><td>Lifecycle is owned by the module that stores the file. Overlaybd only defines the format and open/merge behavior.</td><td>Depends on owner.</td></tr>
 </tbody>
