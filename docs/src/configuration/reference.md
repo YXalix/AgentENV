@@ -494,6 +494,7 @@ the default path on every startup.
 | `track_dirty_pages` | bool | `false` | Enable Firecracker KVM dirty-page tracking for memory snapshots. It defaults to false. The option is temporarily disabled in PVM mode because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true` to enable it. |
 | `compression_enabled` | bool | `false` | Enable compression for memory snapshot layers. When disabled, `compression_algorithm` is still parsed but has no effect. This setting affects only memory layers; the physical file name remains `overlaybd.commit`. |
 | `compression_algorithm` | string | `"lz4"` | Compression algorithm for memory snapshot layers. Valid values are only `lz4` and `zstd`. |
+| `max_overlaybd_layers` | integer | `3` | Soft cap on overlaybd lowers in a committed memory-snapshot image; the runtime-owned suffix is compacted once it exceeds this count. Must be within `1..=255` (`MAX_STACK_LAYERS`). |
 
 ## `[memory_snapshot.background_download]`
 

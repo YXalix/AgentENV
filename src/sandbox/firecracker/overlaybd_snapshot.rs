@@ -375,6 +375,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         output_dir,
         appended_layer,
         MANAGED_BASE_LAYER_FILE,
+        DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS,
         // Rootfs layers must stay raw: only memory snapshots may be compressed.
         OverlaybdCompactOutput::Raw,
     )
@@ -395,6 +396,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
     output_dir: &Path,
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
+    max_snapshot_layers: usize,
     compaction_output: OverlaybdCompactOutput,
 ) -> Result<Vec<LayerConfig>> {
     rewrite_lowers_with_runtime_roots(
@@ -403,6 +405,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
         appended_layer,
         compaction_output_name,
         canonicalized_runtime_owned_roots(),
+        max_snapshot_layers,
         compaction_output,
     )
     .await
@@ -414,17 +417,16 @@ async fn rewrite_lowers_with_runtime_roots(
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
+    max_snapshot_layers: usize,
     compaction_output: OverlaybdCompactOutput,
 ) -> Result<Vec<LayerConfig>> {
     let (mut lowers, mut runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots);
 
-    // If the total number of lowers exceeds the default maximum, try to compact the
-    // runtime-owned suffix and appended layers into a single layer.
+    // Compact the runtime suffix (and appended layer) into one layer when the
+    // stable lowers plus that suffix would exceed the configured maximum.
     let compactable_count = runtime_owned_lowers.len() + usize::from(appended_layer.is_some());
-    if compactable_count > 1
-        && lowers.len() + compactable_count > DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS
-    {
+    if compactable_count > 1 && lowers.len() + compactable_count > max_snapshot_layers {
         let mut runtime_suffix = runtime_owned_lowers;
         if let Some(layer) = appended_layer {
             runtime_suffix.push(layer);
@@ -570,6 +572,9 @@ pub(super) async fn build_mem_snapshot_image_config(
         output_dir,
         Some(new_layer),
         "mem_compacted.commit",
+        ConfigManager::global_config()
+            .memory_snapshot
+            .max_overlaybd_layers,
         memory_output,
     )
     .await?;
@@ -962,6 +967,7 @@ mod tests {
             None,
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
+            DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS,
             OverlaybdCompactOutput::Raw,
         )
         .await
@@ -1044,7 +1050,10 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let parent_config_path = temp.path().join("parent-mem-image.json");
         let repo_blob_url = "s3://agentenv-oss-validation/validation/managed-layers";
-        let remote_lowers: Vec<_> = (0..DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS)
+        let max_snapshot_layers = ConfigManager::global_config()
+            .memory_snapshot
+            .max_overlaybd_layers;
+        let remote_lowers: Vec<_> = (0..max_snapshot_layers)
             .map(|index| {
                 json!({
                     "digest": format!("sha256:parent-{index}"),
@@ -1078,12 +1087,9 @@ mod tests {
         .expect("build memory image config");
 
         assert_eq!(image_config.repo_blob_url, repo_blob_url);
-        assert_eq!(
-            image_config.lowers.len(),
-            DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS + 1
-        );
+        assert_eq!(image_config.lowers.len(), max_snapshot_layers + 1);
         assert_eq!(image_config.lowers[0].digest, "sha256:parent-0");
-        assert!(image_config.lowers[..DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS]
+        assert!(image_config.lowers[..max_snapshot_layers]
             .iter()
             .all(|lower| lower.file.is_empty()));
         let latest = image_config.lowers.last().expect("latest mem lower");

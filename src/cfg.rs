@@ -421,6 +421,10 @@ pub struct MemorySnapshotConfig {
     /// memory layer. 1 = sequential (identical output layout at any value).
     #[config(default = 1)]
     pub compression_workers: usize,
+    /// Soft cap on overlaybd lowers in a committed memory-snapshot image;
+    /// the runtime-owned suffix is compacted once it exceeds this count (1..=255).
+    #[config(default = 3)]
+    pub max_overlaybd_layers: usize,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
@@ -932,6 +936,10 @@ impl AppConfig {
 
     fn validate_memory_snapshot_options(&self) -> Result<()> {
         let memory = &self.memory_snapshot;
+        validate_overlaybd_layer_cap(
+            memory.max_overlaybd_layers,
+            "memory_snapshot.max_overlaybd_layers",
+        )?;
         if !memory.track_dirty_pages {
             return Ok(());
         }
@@ -1061,6 +1069,16 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+fn validate_overlaybd_layer_cap(value: usize, field: &'static str) -> Result<()> {
+    if value == 0 || value > overlaybd::index_file::MAX_STACK_LAYERS {
+        bail!(
+            "{field} ({value}) must be within 1..={} (overlaybd MAX_STACK_LAYERS)",
+            overlaybd::index_file::MAX_STACK_LAYERS
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1319,6 +1337,66 @@ mod tests {
                 None => result.expect("supported memory snapshot options should be valid"),
             }
         }
+    }
+
+    fn memory_snapshot_max_overlaybd_layers_range() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "[memory_snapshot]\nmax_overlaybd_layers = 5\n")?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert_eq!(config.config().memory_snapshot.max_overlaybd_layers, 5);
+
+        for invalid in [0usize, overlaybd::index_file::MAX_STACK_LAYERS + 1] {
+            std::fs::write(
+                &path,
+                format!("[memory_snapshot]\nmax_overlaybd_layers = {invalid}\n"),
+            )?;
+            let error = ConfigManager::new_from_path(&path).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("memory_snapshot.max_overlaybd_layers"),
+                "unexpected error for {invalid}: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    fn memory_snapshot_config_defaults_are_valid() -> Result<()> {
+        let default = MemorySnapshotConfig::default();
+        assert!(!default.compression_enabled);
+        assert!(!default.track_dirty_pages);
+        assert_eq!(
+            default.compression_algorithm,
+            MemorySnapshotCompressionAlgorithm::Lz4
+        );
+        assert_eq!(default.compression_workers, 1);
+        assert_eq!(default.max_overlaybd_layers, 3);
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for relative in ["config/default.toml", "config/oss_default.toml"] {
+            let config = ConfigManager::new_from_path(&workspace.join(relative))?;
+            assert!(!config.config().memory_snapshot.compression_enabled);
+            assert!(
+                !config.config().memory_snapshot.track_dirty_pages,
+                "unexpected track_dirty_pages default in {relative}"
+            );
+            assert_eq!(
+                config.config().memory_snapshot.compression_algorithm,
+                MemorySnapshotCompressionAlgorithm::Lz4,
+                "unexpected compression default in {relative}"
+            );
+            assert_eq!(
+                config.config().memory_snapshot.compression_workers,
+                1,
+                "unexpected compression_workers default in {relative}"
+            );
+            assert_eq!(
+                config.config().memory_snapshot.max_overlaybd_layers,
+                3,
+                "unexpected max_overlaybd_layers default in {relative}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

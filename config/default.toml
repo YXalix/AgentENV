@@ -310,6 +310,9 @@ compression_algorithm = "lz4"
 # Workers compressing 4 KiB blocks. One is sequential; higher values run in
 # parallel without changing the output layout.
 compression_workers = 1
+# Soft cap on overlaybd lowers in a committed memory-snapshot image;
+# the runtime-owned suffix is compacted once it exceeds this count (1..=255).
+max_overlaybd_layers = 3
 
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd
