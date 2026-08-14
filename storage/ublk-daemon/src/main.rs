@@ -15,6 +15,22 @@ use uvm_ublk_daemon::{server::UblkDaemonServer, ResizeToolSpec};
 
 mod metrics_server;
 
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc tuning, mirroring src/bin/server.rs: purge dirty/muzzy pages after
+// 1s on a background thread instead of the default 10s. Pause/resume churn
+// allocates and frees large buffers over and over (per-layer index loads, the
+// merged index, premerged artifact bodies). glibc malloc retains those freed
+// pages in its arenas — after its dynamic mmap threshold climbs to 32MB the
+// multi-MB buffers come off the arena heap and freed arena pages are never
+// returned to the OS — so RSS plateaus high and stays there long after the
+// churn ends (issue #171).
+#[used]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:true\0";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "uvm-ublk-daemon",
