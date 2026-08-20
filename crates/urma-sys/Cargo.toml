@@ -1,0 +1,21 @@
+[package]
+name = "urma-sys"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Raw FFI bindings to the openEuler UMDK liburma (URMA) C API"
+
+[dependencies]
+
+[features]
+default = []
+# Gates examples that reference the liburma extern symbols: building them
+# requires liburma.so at link time (umdk-urma-devel on openEuler). Enabling
+# the feature makes build.rs emit `cargo:rustc-link-lib=dylib=urma`; the
+# crate itself still has no #[link] attribute, so the link-free default for
+# plain consumers is unchanged.
+link-urma = []
+
+[[example]]
+name = "one_sided_read"
+required-features = ["link-urma"]

@@ -579,6 +579,43 @@ pub struct P2pConfig {
     pub fetch_timeout_ms: u64,
     #[config(default = 5u64)]
     pub peer_discovery_refresh_interval_secs: u64,
+    #[config(nested)]
+    pub ub: UbP2pConfig,
+}
+
+/// Settings for the `ub` P2P transport backend (URMA one-sided reads over
+/// Kunpeng UB), used when `[p2p].transport = "ub"`.
+#[derive(Debug, Config, Clone)]
+pub struct UbP2pConfig {
+    /// URMA device name (e.g. `urma0`); an empty value picks the first device.
+    #[config(default = "urma0")]
+    pub device: String,
+    /// Driver backend: `ffi` uses the real `liburma` (requires the `p2p-urma`
+    /// cargo feature and UB hardware); `loopback` is an in-process test driver.
+    #[config(default = "ffi")]
+    pub driver: String,
+    /// Number of jetties created for peers to bind to.
+    #[config(default = 2u32)]
+    pub jetty_count: u32,
+    /// Per-jetty send queue depth (max outstanding work requests).
+    #[config(default = 256u32)]
+    pub max_wr: u32,
+    /// Completion queue depth.
+    #[config(default = 4096u32)]
+    pub jfc_depth: u32,
+    /// Remote-read slice size in bytes; also the bounce-buffer block size.
+    /// Must be a positive multiple of 4096.
+    #[config(default = 1048576u64)]
+    pub slice_size_bytes: u64,
+    /// Maximum concurrent one-sided reads.
+    #[config(default = 16u32)]
+    pub max_inflight_reads: u32,
+    /// Publish arena size in bytes (mapped and registered once at startup).
+    #[config(default = 268435456u64)]
+    pub arena_size_bytes: u64,
+    /// Catalog TCP listen address; empty reuses `p2p.listen_addr`.
+    #[config(default = "")]
+    pub catalog_listen_addr: String,
 }
 
 macro_rules! impl_config_default {
@@ -622,6 +659,7 @@ impl_config_default!(
     NodeIdentityConfig,
     OrchestratorConfig,
     P2pConfig,
+    UbP2pConfig,
     CustomExtensionConfig,
 );
 

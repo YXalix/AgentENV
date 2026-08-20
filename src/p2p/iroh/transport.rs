@@ -23,12 +23,12 @@ use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use iroh_blobs::{BlobFormat, BlobsProtocol, HashAndFormat};
 use tracing::{debug, info, instrument, trace, warn};
 
-use super::catalog::{
-    CatalogProtocol, CatalogRequest, CatalogResponse, PublishedArtifactCatalog, CATALOG_ALPN,
-    MAX_CATALOG_RESPONSE_BYTES,
-};
+use super::catalog::{CatalogProtocol, CATALOG_ALPN};
 use super::IROH_BACKEND_ID;
 use crate::digest;
+use crate::p2p::catalog::{
+    CatalogRequest, CatalogResponse, PublishedArtifactCatalog, MAX_CATALOG_RESPONSE_BYTES,
+};
 use crate::p2p::config::ResolvedP2pConfig;
 use crate::p2p::discovery::P2pPeerDiscovery;
 use crate::p2p::error::{Error, Result};

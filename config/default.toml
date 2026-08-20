@@ -114,7 +114,7 @@ low_watermark_ratio = 0.70
 [p2p]
 # Master switch for peer-to-peer artifact transport.
 enabled = false
-# Transport implementation: "iroh" or "disabled".
+# Transport implementation: "iroh", "ub" or "disabled".
 transport = "iroh"
 # Local content store for the transport.
 # store_dir = "$AENV_HOME/p2p/store"
@@ -126,6 +126,24 @@ lookup_timeout_ms = 5000
 fetch_timeout_ms = 30000
 # Seconds between scheduler peer-list refreshes; values below 1 clamp to 1.
 peer_discovery_refresh_interval_secs = 5
+
+# URMA (Kunpeng UB) backend, used when transport = "ub". Requires the
+# `p2p-urma` cargo feature and liburma (umdk-urma-devel) for driver = "ffi";
+# driver = "loopback" is an in-process test driver that needs no hardware.
+# [p2p.ub]
+# device = "urma0"
+# driver = "ffi"
+# jetty_count = 2
+# max_wr = 256
+# jfc_depth = 4096
+# Remote-read slice / bounce block size in bytes (page-aligned).
+# slice_size_bytes = 1048576
+# max_inflight_reads = 16
+# Publish arena size in bytes; published artifacts that are not mmap'd by
+# reference are copied into this region.
+# arena_size_bytes = 268435456
+# Catalog TCP listen address; defaults to p2p.listen_addr.
+# catalog_listen_addr = ""
 
 [custom_extension]
 # HTTP base URL for sandbox lifecycle hooks. Leave unset to disable the

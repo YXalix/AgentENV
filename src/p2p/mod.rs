@@ -1,3 +1,4 @@
+mod catalog;
 mod config;
 mod discovery;
 mod error;
@@ -6,6 +7,7 @@ mod iroh;
 pub(crate) mod mock;
 mod transport;
 mod types;
+mod urma;
 
 use std::sync::Arc;
 
@@ -35,6 +37,12 @@ pub async fn transport_from_config(
             Ok(Arc::new(
                 iroh::IrohBlobsP2pTransport::new(p2p, node_identity.id.clone(), peer_discovery)
                     .await?,
+            ))
+        }
+        P2pTransportKind::Ub => {
+            let peer_discovery = peer_discovery_from_config(config, &p2p, node_identity);
+            Ok(Arc::new(
+                urma::UrmaP2pTransport::new(p2p, node_identity.id.clone(), peer_discovery).await?,
             ))
         }
     }
