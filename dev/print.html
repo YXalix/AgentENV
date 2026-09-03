@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-95cfd7e3.js";
+            window.path_to_searchindex_js = "searchindex-3ec94f5d.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-d21ca9d8.js"></script>
+        <script src="toc-a02e686b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -474,9 +474,10 @@ aenv template delete &lt;template-id&gt;
 <p>Start a sandbox and attach an interactive shell. <code>&lt;target&gt;</code> accepts a template
 or snapshot ID or alias, or an OCI image reference with <code>--cold</code>.</p>
 <pre><code class="language-bash">aenv start my-ubuntu
-aenv start --secure my-ubuntu               # require token-authenticated envd access
 aenv start --cold ubuntu:24.04              # start directly from an OCI image
 </code></pre>
+<p>Sandboxes started by <code>aenv</code> always require token-authenticated envd access. The
+CLI obtains and manages the access token automatically.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -484,7 +485,6 @@ aenv start --cold ubuntu:24.04              # start directly from an OCI image
 </thead>
 <tbody>
 <tr><td><code>--cold</code></td><td>Start directly from an external OCI image instead of a template</td></tr>
-<tr><td><code>--secure</code></td><td>Require token authentication for envd control communication</td></tr>
 <tr><td><code>--timeout &lt;secs&gt;</code></td><td>Sandbox TTL in seconds (default: 300)</td></tr>
 <tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores; only valid with <code>--cold</code>. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory in MiB; only valid with <code>--cold</code>. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
@@ -601,6 +601,44 @@ extended attributes, or hard-link relationships.</p>
 <pre><code class="language-bash">aenv delete &lt;sandbox-id&gt;
 aenv rm &lt;sandbox-id&gt;
 </code></pre>
+<hr>
+<h2 id="volumes"><a class="header" href="#volumes">Volumes</a></h2>
+<h3 id="aenv-volume-create-name"><a class="header" href="#aenv-volume-create-name"><code>aenv volume create &lt;name&gt;</code></a></h3>
+<p>Create an independent persistent volume. Volumes default to 65536 MiB (64 GiB)
+and <code>exclusive</code> mode.</p>
+<pre><code class="language-bash">aenv volume create workspace
+aenv volume create models --mode ro --image ghcr.io/example/models:latest
+aenv volume create job-workspace --from-volume workspace
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--size-mb &lt;MiB&gt;</code></td><td>Volume size. A copy-on-write fork must use the same size as its source.</td></tr>
+<tr><td><code>--mode &lt;exclusive|ro&gt;</code></td><td>Access mode. Exclusive volumes are writable by one sandbox; read-only volumes can be shared.</td></tr>
+<tr><td><code>--from-volume &lt;volume&gt;</code></td><td>Create a copy-on-write fork from an existing volume ID or name.</td></tr>
+<tr><td><code>--image &lt;image&gt;</code></td><td>Initialize the volume from an OCI image.</td></tr>
+</tbody>
+</table>
+</div>
+<p>We recommend creating an exclusive fork for each sandbox instead of mounting a
+shared writable volume directly:</p>
+<pre><code class="language-bash">aenv volume create job-data --mode exclusive --from-volume dataset-base
+aenv start ubuntu --volume /workspace/data=job-data
+</code></pre>
+<p>See <a href="#volumes-1">Volumes</a> for access-mode semantics, lifecycle
+behavior, automatic sandbox fork and snapshot handling, and complete CLI and
+HTTP API examples.</p>
+<h3 id="inspect-and-delete-volumes"><a class="header" href="#inspect-and-delete-volumes">Inspect and delete volumes</a></h3>
+<pre><code class="language-bash">aenv volume list
+aenv volume list --output json
+aenv volume inspect job-data
+aenv volume delete job-data
+</code></pre>
+<p>A mounted volume cannot be deleted. <code>aenv volume ls</code> is an alias for
+<code>aenv volume list</code>.</p>
 <hr>
 <h2 id="snapshots"><a class="header" href="#snapshots">Snapshots</a></h2>
 <h3 id="aenv-snapshot-create-sandbox-id"><a class="header" href="#aenv-snapshot-create-sandbox-id"><code>aenv snapshot create &lt;sandbox-id&gt;</code></a></h3>
@@ -1802,8 +1840,9 @@ ENVD_ACCESS_TOKEN=$(printf '%s' "$SANDBOX_RESPONSE" | jq -r '.envdAccessToken')
   -H "x-agentenv-target-port: 49983" \
   -H "X-Access-Token: $ENVD_ACCESS_TOKEN"
 </code></pre>
-<p>The <code>aenv</code> CLI handles this automatically. Use <code>--secure</code> when starting a sandbox:</p>
-<pre><code class="language-bash">aenv start --secure &lt;template-or-snapshot&gt;
+<p>The <code>aenv</code> CLI always requests secure sandbox authentication and handles the
+envd access token automatically:</p>
+<pre><code class="language-bash">aenv start &lt;template-or-snapshot&gt;
 </code></pre>
 <p>For <code>connect</code>, <code>exec</code>, <code>upload</code>, and
 <code>download</code>, it obtains the token through the authenticated AgentENV API and
@@ -2037,7 +2076,6 @@ aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 </thead>
 <tbody>
 <tr><td><code>&lt;template-or-snapshot&gt;</code></td><td>Required</td><td>Template or snapshot ID or alias.</td></tr>
-<tr><td><code>--secure</code></td><td>Off</td><td>Require an envd access token for command and file operations. The CLI manages the token automatically; see <a href="#secure-sandbox-authentication">Authentication</a>.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
 </tbody>
@@ -2045,7 +2083,9 @@ aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 </div>
 <p>Without <code>--detach</code>, <code>aenv start</code> waits for the sandbox to become ready and then
 attaches an interactive shell. CPU, memory, and disk settings are inherited
-from the template or snapshot and cannot be overridden on a warm start.</p>
+from the template or snapshot and cannot be overridden on a warm start. The CLI
+always enables secure sandbox authentication and manages the envd access token
+automatically; see <a href="#secure-sandbox-authentication">Authentication</a>.</p>
 <p>To retrieve the current state and configuration of one sandbox, use the HTTP
 API:</p>
 <pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
@@ -2070,7 +2110,6 @@ aenv start --cold ubuntu:24.04 --cpu 4 --memory 4096 --disk-size-mb 65536
 <tbody>
 <tr><td><code>&lt;image&gt;</code></td><td>Required</td><td>External OCI image reference.</td></tr>
 <tr><td><code>--cold</code></td><td>Required for an OCI image</td><td>Cold start directly from <code>&lt;image&gt;</code>.</td></tr>
-<tr><td><code>--secure</code></td><td>Off</td><td>Require an envd access token for command and file operations. The CLI manages the token automatically; see <a href="#secure-sandbox-authentication">Authentication</a>.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
 <tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your AgentENV config file</td><td>Set the sandbox’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set sandbox memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
@@ -2079,6 +2118,7 @@ aenv start --cold ubuntu:24.04 --cpu 4 --memory 4096 --disk-size-mb 65536
 </tbody>
 </table>
 </div>
+<p>Cold-started sandboxes also use secure sandbox authentication by default.</p>
 <p>The AgentENV config file is <code>config/default.toml</code> by default, or the file
 specified by <code>AENV_CONFIG_PATH</code>.</p>
 <p>An OverlayBD-native image can start without downloading
@@ -2511,12 +2551,13 @@ aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
 </thead>
 <tbody>
 <tr><td><code>&lt;snapshot-id-or-name&gt;</code></td><td>Required</td><td>Snapshot ID or alias to start from.</td></tr>
-<tr><td><code>--secure</code></td><td>Disabled</td><td>Requires an envd access token for sandbox control communication.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Sets the sandbox TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Disabled</td><td>Prints the new sandbox ID without attaching an interactive shell.</td></tr>
 </tbody>
 </table>
 </div>
+<p>The CLI always enables secure sandbox authentication and manages the envd
+access token automatically.</p>
 <h3 id="delete-a-snapshot"><a class="header" href="#delete-a-snapshot">Delete a Snapshot</a></h3>
 <p>Snapshots and templates share the same catalog. Delete a snapshot by passing
 its required ID or alias to the template delete command:</p>
@@ -2537,6 +2578,178 @@ p2p_enabled = true
 </code></pre>
 <p>See the <a href="#p2p">Configuration Reference</a>
 for the optional transport, storage-directory, address, and timeout settings.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="volumes-1"><a class="header" href="#volumes-1">Volumes</a></h1>
+<blockquote>
+<p><strong>Beta:</strong> The volume feature is still in beta. For workloads that can use a
+drive supplied only when cold-starting a sandbox, the <code>attachedDrives</code>
+feature on <code>POST /sandboxes-cold</code> is more extensively tested. See the
+<a href="#api-reference">API reference</a> for the extra-drive request schema.</p>
+</blockquote>
+<p>Volumes are persistent block filesystems managed independently from sandboxes.
+A volume has a stable ID, a unique name, a fixed size, and an access mode. You
+can mount it at an absolute guest path when creating a sandbox, then reuse its
+contents after that sandbox is deleted.</p>
+<p>The default volume size is 65536 MiB (64 GiB). By default, one sandbox may
+mount up to four volumes and each volume may be at most 262144 MiB (256 GiB).
+Administrators can change these limits in the <a href="#volume"><code>[volume]</code> configuration</a>.</p>
+<h2 id="access-modes"><a class="header" href="#access-modes">Access Modes</a></h2>
+<p>A volume’s mode is selected when the volume is created and cannot be changed.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Mode</th><th>Writable</th><th>Mount concurrency</th><th>Intended use</th></tr>
+</thead>
+<tbody>
+<tr><td><code>exclusive</code></td><td>Yes</td><td>One sandbox</td><td>Per-sandbox workspaces, caches, databases, and mutable state</td></tr>
+<tr><td><code>ro</code></td><td>No</td><td>Multiple sandboxes</td><td>Shared datasets, models, tools, and other immutable inputs</td></tr>
+</tbody>
+</table>
+</div>
+<p>An exclusive volume is reserved by its mounted sandbox. Another sandbox cannot
+mount or delete it until that reservation is released. A read-only volume can
+be mounted by multiple sandboxes at the same time, but guest writes fail.</p>
+<h2 id="recommended-workflow-fork-before-use"><a class="header" href="#recommended-workflow-fork-before-use">Recommended Workflow: Fork Before Use</a></h2>
+<p>Treat a shared volume as an immutable base and create a copy-on-write fork for
+each sandbox that needs to modify it. This gives every sandbox an independent
+exclusive volume without copying all source data eagerly.</p>
+<pre><code class="language-text">read-only base volume
+        |
+        +-- exclusive fork for sandbox A
+        +-- exclusive fork for sandbox B
+</code></pre>
+<p>Forks capture the source volume state at creation time. Later changes to a fork
+do not change the source or another fork. The fork must have the same size as
+its source. An exclusive source must be unmounted before a public fork is
+created; a read-only source may remain shared.</p>
+<h2 id="sandbox-forks-and-snapshots"><a class="header" href="#sandbox-forks-and-snapshots">Sandbox Forks and Snapshots</a></h2>
+<p>AgentENV automatically carries mounted volumes through sandbox fork and
+snapshot operations. You do not need to fork or snapshot each mounted volume
+separately.</p>
+<h3 id="fork-a-sandbox"><a class="header" href="#fork-a-sandbox">Fork a sandbox</a></h3>
+<p>When a sandbox is forked, AgentENV processes every mounted volume for every
+child sandbox:</p>
+<ul>
+<li>Each mounted <code>exclusive</code> volume gets an independent copy-on-write volume
+fork. The child mounts the new volume at the same guest path and can modify
+it without changing the source sandbox’s volume.</li>
+<li>Each mounted <code>ro</code> volume remains mounted from the same read-only volume. It
+is safe to share because neither the source nor a child can modify it.</li>
+</ul>
+<p>This behavior is separate from manually creating a reusable volume fork with
+<code>aenv volume create --from-volume</code>.</p>
+<h3 id="snapshot-a-sandbox"><a class="header" href="#snapshot-a-sandbox">Snapshot a sandbox</a></h3>
+<p>When a sandbox is snapshotted, every mounted volume is included automatically.
+The volume snapshot records its layers, size, mount path, and access mode.
+Starting a sandbox from that snapshot creates new volumes with the captured
+contents and mounts them at the same paths. An exclusive volume remains
+exclusive; a read-only volume remains read-only.</p>
+<p>Volume snapshots are independent from their source volumes. Deleting a source
+volume does not remove volume data already committed into a sandbox snapshot.</p>
+<h2 id="cli-examples"><a class="header" href="#cli-examples">CLI Examples</a></h2>
+<h3 id="create-and-mount-an-empty-volume"><a class="header" href="#create-and-mount-an-empty-volume">Create and mount an empty volume</a></h3>
+<pre><code class="language-bash">aenv volume create workspace --mode exclusive --size-mb 65536
+aenv start ubuntu --volume /workspace=workspace
+</code></pre>
+<p><code>--volume</code> accepts <code>MOUNT_PATH=VOLUME_ID_OR_NAME</code> and can be repeated. Mount
+paths must be absolute, cannot be <code>/</code>, and cannot overlap another mount.</p>
+<pre><code class="language-bash">aenv start ubuntu \
+  --volume /workspace=workspace \
+  --volume /models=models-base
+</code></pre>
+<h3 id="create-a-volume-from-an-oci-image"><a class="header" href="#create-a-volume-from-an-oci-image">Create a volume from an OCI image</a></h3>
+<p>Use <code>--image</code> to initialize a volume with the contents of an OCI image:</p>
+<pre><code class="language-bash">aenv volume create models-base \
+  --mode ro \
+  --image registry.example.com/team/models:latest
+</code></pre>
+<p>For a standard OCI image, AgentENV downloads and converts its layers when the
+volume is created. For an OverlayBD-native image, AgentENV keeps the remote
+layer references and does not download the layer contents during volume
+creation. Blocks are fetched from the OCI registry on demand when the mounted
+volume is read, and then retained in the local remote-block cache.</p>
+<h3 id="create-a-reusable-base-and-fork-it"><a class="header" href="#create-a-reusable-base-and-fork-it">Create a reusable base and fork it</a></h3>
+<p>First populate an exclusive seed volume:</p>
+<pre><code class="language-bash">aenv volume create dataset-seed --mode exclusive
+SANDBOX_ID=$(aenv start ubuntu -d --volume /data=dataset-seed)
+aenv exec "$SANDBOX_ID" sh -lc 'printf "%s\n" training-data &gt; /data/input.txt'
+aenv delete "$SANDBOX_ID"
+</code></pre>
+<p>Create a read-only base from the seed, then create one exclusive fork per
+sandbox:</p>
+<pre><code class="language-bash">aenv volume create dataset-base --mode ro --from-volume dataset-seed
+aenv volume create job-42-data --mode exclusive --from-volume dataset-base
+aenv start ubuntu --volume /data=job-42-data
+</code></pre>
+<p>These commands use the default 64 GiB size for every volume. When the source
+has a custom size, pass the same <code>--size-mb</code> value while creating its fork.</p>
+<h3 id="share-a-read-only-volume"><a class="header" href="#share-a-read-only-volume">Share a read-only volume</a></h3>
+<pre><code class="language-bash">SANDBOX_A=$(aenv start ubuntu -d --volume /models=models-base)
+SANDBOX_B=$(aenv start ubuntu -d --volume /models=models-base)
+</code></pre>
+<p>Both sandboxes can read <code>/models</code>. Neither sandbox can modify it.</p>
+<h3 id="inspect-lifecycle-state"><a class="header" href="#inspect-lifecycle-state">Inspect lifecycle state</a></h3>
+<pre><code class="language-bash">aenv volume list
+aenv volume inspect job-42-data
+aenv volume delete job-42-data
+</code></pre>
+<p>The volume status controls whether it can be mounted:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ready</code></td><td>The volume can be mounted.</td></tr>
+<tr><td><code>uploading</code></td><td>Publication is in progress; the volume is temporarily unavailable.</td></tr>
+<tr><td><code>failed</code></td><td>Publication failed; the volume is unavailable until recovered.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Deleting a mounted volume returns a conflict. Delete its sandbox first, then
+delete the volume.</p>
+<h2 id="http-api-examples"><a class="header" href="#http-api-examples">HTTP API Examples</a></h2>
+<p>Set the server URL and API key before running these examples:</p>
+<pre><code class="language-bash">export AENV_URL=http://127.0.0.1:8000
+export AENV_API_KEY=&lt;api-key&gt;
+</code></pre>
+<p>Create a read-only base volume:</p>
+<pre><code class="language-bash">curl -fsS -X POST "$AENV_URL/volumes" \
+  -H "X-API-Key: $AENV_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "dataset-base",
+    "sizeMB": 65536,
+    "mode": "ro",
+    "image": "ghcr.io/example/dataset:latest"
+  }'
+</code></pre>
+<p>Create an exclusive copy-on-write fork:</p>
+<pre><code class="language-bash">curl -fsS -X POST "$AENV_URL/volumes" \
+  -H "X-API-Key: $AENV_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "job-42-data",
+    "sizeMB": 65536,
+    "mode": "exclusive",
+    "fromVolume": "dataset-base"
+  }'
+</code></pre>
+<p>Mount the fork into a sandbox:</p>
+<pre><code class="language-bash">curl -fsS -X POST "$AENV_URL/sandboxes" \
+  -H "X-API-Key: $AENV_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "templateID": "ubuntu",
+    "volumeMounts": {
+      "/workspace/data": "job-42-data"
+    }
+  }'
+</code></pre>
+<p>List and inspect volumes:</p>
+<pre><code class="language-bash">curl -fsS "$AENV_URL/volumes" -H "X-API-Key: $AENV_API_KEY"
+curl -fsS "$AENV_URL/volumes/job-42-data" -H "X-API-Key: $AENV_API_KEY"
+</code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="custom-extension"><a class="header" href="#custom-extension">Custom Extension</a></h1>
 <p>The custom extension is an optional external HTTP service that AgentENV calls during the sandbox lifecycle. It lets you implement deployment-specific behavior — for example, connecting sandboxes into a VPN, custom firewall rules, or extra mounts — without changing AgentENV itself.</p>
@@ -3223,6 +3436,18 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 </div>
 <p>The managed seed is node-local persistent state and must be included in backups of <code>$AENV_HOME</code>. AgentENV refuses to generate a replacement when persisted secure or private-ingress sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates existing sandbox access tokens.</p>
 <p>Configure <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.</p>
+<h2 id="volume"><a class="header" href="#volume"><code>[volume]</code></a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_size_mb</code></td><td>integer</td><td><code>262144</code></td><td>Maximum persistent volume size in MiB (256 GiB).</td></tr>
+<tr><td><code>max_volume_count</code></td><td>integer</td><td><code>4</code></td><td>Maximum number of persistent volumes that one sandbox may mount. Must be between 1 and the Firecracker extra-drive limit.</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="orchestrator"><a class="header" href="#orchestrator"><code>[orchestrator]</code></a></h2>
 <p>Sandbox lifecycle management.</p>
 <div class="table-wrapper">
@@ -3581,6 +3806,24 @@ and are then re-fetched on demand.</p>
 <tr><td><code>block_size</code></td><td>integer</td><td><code>16777216</code></td><td>Background download chunk size in bytes (16 MiB): one source request fetches a chunk of this size, aligned down to whole cache blocks. The cache keeps its own smaller block size for foreground reads, so background downloads keep large-request throughput while foreground keeps fine-grained on-demand reads. Peak scratch per active layer download is <code>block_size × concurrency</code>.</td></tr>
 <tr><td><code>concurrency</code></td><td>integer</td><td><code>4</code></td><td>Maximum number of in-flight block remote reads within a single remote layer. <code>1</code> keeps the historical serial behavior. Must be greater than zero.</td></tr>
 <tr><td><code>max_inflight_blocks</code></td><td>integer</td><td><code>16</code></td><td>Cap on concurrently downloading chunks enforced by each file-cache backend’s download scheduler, shared by every concurrent layer download on that backend; bounds total scratch memory to <code>max_inflight_blocks</code> × the download chunk size (<code>block_size</code>). The value is fixed when the backend is created from the global config; a per-image <code>download</code> override never resizes the scheduler-owned cap (the first mismatch per scheduler is logged as <code>max_inflight_blocks_override_ignored</code>). Must be greater than zero.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="template_build"><a class="header" href="#template_build"><code>[template_build]</code></a></h2>
+<p>Compression settings applied when a template build captures its snapshot.
+This section is fully independent of <code>[memory_snapshot].compression_enabled</code>:
+template builds consult only these keys, for both memory layers and the
+sealed rootfs read-write layer. Pause/snapshot captures of running sandboxes
+are not affected, and rootfs seals stay raw there.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>compression_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable compression for snapshot artifacts captured by template builds. When enabled, both the memory layers and the sealed rootfs read-write layer are written as ZFile-compressed layers.</td></tr>
+<tr><td><code>compression_algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm. Valid values are only <code>lz4</code> and <code>zstd</code>. Parsed but ignored when compression is disabled.</td></tr>
+<tr><td><code>compression_workers</code></td><td>integer</td><td><code>1</code></td><td>Number of blocking threads used to compress 4 KiB blocks within a layer. <code>1</code> is sequential; higher values run in parallel without changing the output layout. Clamped to 64.</td></tr>
 </tbody>
 </table>
 </div>
