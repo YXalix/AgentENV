@@ -116,7 +116,7 @@ impl SnapshotManager {
             .repository
             .publish(metadata.clone(), manifest.clone())
             .await?;
-        self.publish_p2p_artifacts(&record, &manifest).await;
+        self.publish_p2p_artifacts(record.clone(), manifest);
         Ok(record)
     }
 
@@ -137,27 +137,34 @@ impl SnapshotManager {
             .repository
             .publish(metadata.clone(), manifest.clone())
             .await?;
-        self.publish_p2p_artifacts(&record, &manifest).await;
+        self.publish_p2p_artifacts(record.clone(), manifest);
         Ok(record)
     }
 
     /// Best effort attempt to publish snapshot artifacts to P2P.
-    #[tracing::instrument(skip(self, record, manifest), fields(snapshot_id = %record.id))]
-    async fn publish_p2p_artifacts(
-        &self,
-        record: &SnapshotRecord,
-        manifest: &FirecrackerSnapshotManifest,
-    ) {
-        let Some(transport) = self.p2p_transport.as_ref() else {
+    ///
+    /// Runs detached so artifact imports never block the commit path; the
+    /// committed record stays the source of truth regardless of the outcome.
+    fn publish_p2p_artifacts(&self, record: SnapshotRecord, manifest: FirecrackerSnapshotManifest) {
+        let Some(transport) = self.p2p_transport.clone() else {
             return;
         };
+        tokio::spawn(Self::advertise_p2p_artifacts(transport, record, manifest));
+    }
+
+    #[tracing::instrument(skip_all, fields(snapshot_id = %record.id))]
+    async fn advertise_p2p_artifacts(
+        transport: Arc<dyn P2pTransport>,
+        record: SnapshotRecord,
+        manifest: FirecrackerSnapshotManifest,
+    ) {
         let snapshot_id = &record.id;
         let Some(committed) = record.committed.as_ref() else {
             return;
         };
 
         // Prepare the manifest and VM state.
-        let manifest_bytes = serde_json::to_vec(manifest).expect("manifest should serialize");
+        let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest should serialize");
         let mut artifacts = vec![
             SnapshotP2pArtifact::fixed(
                 snapshot_id,
@@ -207,6 +214,7 @@ impl SnapshotManager {
         }
 
         // Publish all artifacts concurrently, but don't fail if any individual artifact fails to publish.
+        let transport = &transport;
         stream::iter(artifacts)
             .for_each_concurrent(SNAPSHOT_P2P_PUBLISH_CONCURRENCY, |artifact| async move {
                 if let Err(error) = artifact.publish(transport).await {
@@ -322,6 +330,8 @@ mod tests {
     use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotPublishMetadata};
     use std::path::Path;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn test_manager(root: &Path) -> SnapshotManager {
@@ -403,7 +413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_advertises_snapshot_artifacts_to_p2p_after_commit() {
+    async fn publish_advertises_snapshot_artifacts_to_p2p_in_background() {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let backend = PosixFsBackend::new(PosixFsBackendConfig {
             root: tempdir.path().join("repository"),
@@ -429,6 +439,10 @@ mod tests {
             .await
             .expect("publish should commit");
 
+        // The current-thread test runtime has not polled the detached
+        // publication task yet, so advertisement must not have started.
+        assert_eq!(p2p.publish_count.load(Ordering::SeqCst), 0);
+
         let vm_state_key = fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
         let manifest_key =
             fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
@@ -437,20 +451,30 @@ mod tests {
             .expect("describe rootfs lower");
         let rootfs_layer_key = layer_key_from_digest(&rootfs_layer_digest.sha256);
 
-        assert!(p2p
-            .lookup(&vm_state_key)
-            .await
-            .expect("lookup vm state")
-            .is_some());
-        assert!(p2p
-            .lookup(&manifest_key)
-            .await
-            .expect("lookup manifest")
-            .is_some());
-        assert!(p2p
-            .lookup(&rootfs_layer_key)
-            .await
-            .expect("lookup rootfs layer")
-            .is_some());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let advertised = p2p
+                    .lookup(&vm_state_key)
+                    .await
+                    .expect("lookup vm state")
+                    .is_some()
+                    && p2p
+                        .lookup(&manifest_key)
+                        .await
+                        .expect("lookup manifest")
+                        .is_some()
+                    && p2p
+                        .lookup(&rootfs_layer_key)
+                        .await
+                        .expect("lookup rootfs layer")
+                        .is_some();
+                if advertised {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background P2P advertisement should complete");
     }
 }
