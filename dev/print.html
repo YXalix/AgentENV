@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3ec94f5d.js";
+            window.path_to_searchindex_js = "searchindex-18a222cd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a02e686b.js"></script>
@@ -2590,6 +2590,15 @@ feature on <code>POST /sandboxes-cold</code> is more extensively tested. See the
 A volume has a stable ID, a unique name, a fixed size, and an access mode. You
 can mount it at an absolute guest path when creating a sandbox, then reuse its
 contents after that sandbox is deleted.</p>
+<p>Deleting a running sandbox freezes its writable volume filesystems, seals and
+publishes their layers, and stops the VM without saving memory or rootfs state.
+This checkpoints the filesystem journal so the next mount avoids journal replay.
+Recoverable capture or publication failures thaw the filesystems and retain the
+running sandbox and its volume reservations. A terminal capture failure stops the
+VM and marks writable volumes <code>failed</code>, preventing mounts of incomplete data.
+Stop or catalog failures retain the deletion state for retry; reservations are
+released only after stop succeeds. Pausing still saves the full sandbox state
+for later resume.</p>
 <p>The default volume size is 65536 MiB (64 GiB). By default, one sandbox may
 mount up to four volumes and each volume may be at most 262144 MiB (256 GiB).
 Administrators can change these limits in the <a href="#volume"><code>[volume]</code> configuration</a>.</p>
@@ -2741,9 +2750,12 @@ export AENV_API_KEY=&lt;api-key&gt;
   -H "Content-Type: application/json" \
   -d '{
     "templateID": "ubuntu",
-    "volumeMounts": {
-      "/workspace/data": "job-42-data"
-    }
+    "volumeMounts": [
+      {
+        "name": "job-42-data",
+        "path": "/workspace/data"
+      }
+    ]
   }'
 </code></pre>
 <p>List and inspect volumes:</p>
@@ -3030,6 +3042,30 @@ await Sandbox.Pause(sandbox.sandboxId, {
 await sandbox.kill();
 </code></pre>
 <p>Replace <code>&lt;template-id&gt;</code> with a template that exists in your local template store. Use <code>e2b template list</code> or <code>GET /v2/templates</code> to see available templates.</p>
+<h3 id="volume-mounts"><a class="header" href="#volume-mounts">Volume mounts</a></h3>
+<p>The TypeScript SDK can create a volume and pass it directly when creating a
+sandbox:</p>
+<pre><code class="language-typescript">import { Sandbox, Volume } from "e2b";
+
+const volume = await Volume.create("workspace-volume", {
+  apiKey: process.env.E2B_API_KEY,
+});
+const sandbox = await Sandbox.create("&lt;template-id&gt;", {
+  apiKey: process.env.E2B_API_KEY,
+  volumeMounts: {
+    "/workspace": volume,
+  },
+});
+</code></pre>
+<p>For the Python SDK, create the volume with <code>aenv volume create</code> or
+<code>POST /volumes</code>, then pass its name when creating a sandbox:</p>
+<pre><code class="language-python">sandbox = Sandbox.create(
+    "&lt;template-id&gt;",
+    volume_mounts={"/workspace": "workspace-volume"},
+)
+</code></pre>
+<p>AgentENV supports the TypeScript SDK’s volume create, list, and delete operations, and accessing the mounted filesystem through the sandbox.
+The E2B SDK’s direct volume content API is not supported.</p>
 <h3 id="python-sdk"><a class="header" href="#python-sdk">Python SDK</a></h3>
 <h4 id="setup-1-1"><a class="header" href="#setup-1-1">Setup</a></h4>
 <p>Install the SDK:</p>
@@ -3170,8 +3206,8 @@ local path overrides, not the default dependency catalog.</p>
 <tr><td><code>socket_timeout_secs</code></td><td>integer</td><td><code>3</code></td><td>Max seconds to wait for the Firecracker API socket</td></tr>
 <tr><td><code>socket_poll_ms</code></td><td>integer</td><td><code>1</code></td><td>Poll interval (ms) for checking socket availability</td></tr>
 <tr><td><code>work_dir</code></td><td>string</td><td><code>"$AENV_HOME/firecracker-work"</code></td><td>Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as <code>overlaybd/upper.data</code> and <code>overlaybd/upper.index</code></td></tr>
-<tr><td><code>serial_dir</code></td><td>string</td><td><code>"$AENV_HOME/logs/serial"</code></td><td>Directory for persistent Firecracker serial output (per-sandbox subdirectories)</td></tr>
-<tr><td><code>log_level</code></td><td>string</td><td>unset (disabled)</td><td>Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>, <code>Debug</code>, <code>Trace</code>, case-insensitive). When set to a non-empty value, Firecracker’s own logging is enabled and written to a <code>firecracker.log</code> file in each sandbox’s log directory (alongside the serial output). Empty/unset disables it</td></tr>
+<tr><td><code>serial_dir</code></td><td>string</td><td><code>"$AENV_HOME/logs/serial"</code></td><td>Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging</td></tr>
+<tr><td><code>log_level</code></td><td>string</td><td>unset (disabled)</td><td>Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>, <code>Debug</code>, <code>Trace</code>, case-insensitive). A non-empty value enables <code>firecracker.log</code> and stdout/stderr capture in each sandbox’s log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream</td></tr>
 </tbody>
 </table>
 </div>
@@ -3625,6 +3661,31 @@ snapshot publication/runtime resolution as an optional acceleration path.</p>
 </tbody>
 </table>
 </div>
+<h2 id="snapshotpublish_compression"><a class="header" href="#snapshotpublish_compression"><code>[snapshot.publish_compression]</code></a></h2>
+<p>Publish-time compression for snapshot layers uploaded to OSS/ACR. Local layers
+always stay raw, so local resume pays no decompression cost; enabled by default,
+memory layers and incremental read-write layers are compressed once as they
+are uploaded, cutting network bytes for cross-node resume. This is the only
+compression switch; the legacy capture-time knobs under <code>[memory_snapshot]</code>
+and <code>[template_build]</code> were removed from the configuration schema.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Compress memory layers and incremental read-write layers when uploading them to OSS/ACR.</td></tr>
+<tr><td><code>algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm. Valid values are only <code>lz4</code> and <code>zstd</code>.</td></tr>
+<tr><td><code>workers</code></td><td>integer</td><td><code>1</code></td><td>Number of blocking threads used to compress 4 KiB blocks within a layer. <code>1</code> is sequential; higher values run in parallel without changing the output layout. Clamped to 64.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Known impact: compressed layers are recorded without a layer uuid (ZFile
+layers carry no LSMT uuid), so P2P uuid-keyed acceleration does not apply to
+them. Snapshot P2P publication also skips digest-keyed advertisements for
+local raw layers whose digest is absent from the committed record — the
+record names the compressed bytes, so the raw digest key would never be
+looked up by consumers.</p>
 <h2 id="backendposix_fs"><a class="header" href="#backendposix_fs"><code>[backend.posix_fs]</code></a></h2>
 <p>POSIX filesystem-backed snapshot repository configuration. This section is used when <code>snapshot.repository_backend = "posix_fs"</code>.</p>
 <div class="table-wrapper">
@@ -3761,8 +3822,6 @@ the default path on every startup.</p>
 <tbody>
 <tr><td><code>overlaybd_global_config_path</code></td><td>string</td><td><code>"$AENV_HOME/overlaybd/mem-overlaybd-global.json"</code></td><td>Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file.</td></tr>
 <tr><td><code>track_dirty_pages</code></td><td>bool</td><td><code>true</code></td><td>Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set <code>AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false</code> to disable it.</td></tr>
-<tr><td><code>compression_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable compression for memory snapshot layers. When disabled, <code>compression_algorithm</code> is still parsed but has no effect. This setting affects only memory layers; the physical file name remains <code>overlaybd.commit</code>.</td></tr>
-<tr><td><code>compression_algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm for memory snapshot layers. Valid values are only <code>lz4</code> and <code>zstd</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -3806,24 +3865,6 @@ and are then re-fetched on demand.</p>
 <tr><td><code>block_size</code></td><td>integer</td><td><code>16777216</code></td><td>Background download chunk size in bytes (16 MiB): one source request fetches a chunk of this size, aligned down to whole cache blocks. The cache keeps its own smaller block size for foreground reads, so background downloads keep large-request throughput while foreground keeps fine-grained on-demand reads. Peak scratch per active layer download is <code>block_size × concurrency</code>.</td></tr>
 <tr><td><code>concurrency</code></td><td>integer</td><td><code>4</code></td><td>Maximum number of in-flight block remote reads within a single remote layer. <code>1</code> keeps the historical serial behavior. Must be greater than zero.</td></tr>
 <tr><td><code>max_inflight_blocks</code></td><td>integer</td><td><code>16</code></td><td>Cap on concurrently downloading chunks enforced by each file-cache backend’s download scheduler, shared by every concurrent layer download on that backend; bounds total scratch memory to <code>max_inflight_blocks</code> × the download chunk size (<code>block_size</code>). The value is fixed when the backend is created from the global config; a per-image <code>download</code> override never resizes the scheduler-owned cap (the first mismatch per scheduler is logged as <code>max_inflight_blocks_override_ignored</code>). Must be greater than zero.</td></tr>
-</tbody>
-</table>
-</div>
-<h2 id="template_build"><a class="header" href="#template_build"><code>[template_build]</code></a></h2>
-<p>Compression settings applied when a template build captures its snapshot.
-This section is fully independent of <code>[memory_snapshot].compression_enabled</code>:
-template builds consult only these keys, for both memory layers and the
-sealed rootfs read-write layer. Pause/snapshot captures of running sandboxes
-are not affected, and rootfs seals stay raw there.</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>compression_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable compression for snapshot artifacts captured by template builds. When enabled, both the memory layers and the sealed rootfs read-write layer are written as ZFile-compressed layers.</td></tr>
-<tr><td><code>compression_algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm. Valid values are only <code>lz4</code> and <code>zstd</code>. Parsed but ignored when compression is disabled.</td></tr>
-<tr><td><code>compression_workers</code></td><td>integer</td><td><code>1</code></td><td>Number of blocking threads used to compress 4 KiB blocks within a layer. <code>1</code> is sequential; higher values run in parallel without changing the output layout. Clamped to 64.</td></tr>
 </tbody>
 </table>
 </div>
@@ -4417,9 +4458,9 @@ POSTROUTING -s &lt;host_interaction_cidr&gt; -j MASQUERADE
 <li><code>boot_args</code>: kernel boot args (e.g. <code>console=ttyS0 ... init=/init</code>).</li>
 <li><code>vcpu_count</code>, <code>mem_size_mib</code>: VM size.</li>
 <li><code>runtime_policy</code>: socket/envd timeouts and poll intervals.</li>
-<li><code>firecracker_stdout_path</code>, <code>firecracker_stderr_path</code>: capture FC logs.
-If unset, logs default to <code>work_dir/logs/firecracker-stdout.log</code> and
-<code>work_dir/logs/firecracker-stderr.log</code>.</li>
+<li><code>common.stdout_path</code>, <code>common.stderr_path</code>: explicit capture directories.
+Otherwise stdout/stderr capture is enabled only when <code>common.firecracker_log_level</code>
+is non-empty, using the serial directory or <code>work_dir/logs</code> fallback.</li>
 <li><code>envd_version</code>: expected envd version for the guest image.</li>
 <li><code>env_vars</code>: optional default environment variables injected after envd init.</li>
 <li><code>ublk_config</code>: optional ublk-backed rootfs configuration.</li>
@@ -4609,7 +4650,9 @@ snapshot-backed template launches, this means recreating runtime image configs a
 writable uppers from the committed layer stack.</li>
 <li>Rootfs copies use copy-on-write helpers where available.</li>
 <li>Firecracker runs with <code>current_dir = work_dir</code>, so relative paths work.</li>
-<li>Firecracker logs default to <code>work_dir/logs/*</code> unless explicit log paths are configured.</li>
+<li>Firecracker logging is disabled by default. Set <code>firecracker.log_level</code> to enable
+stdout/stderr capture and <code>firecracker.log</code> under the configured serial directory.
+Direct Rust callers can also opt individual streams in using explicit destinations.</li>
 <li><code>start()</code> waits for both the API socket and envd readiness.</li>
 <li>Although the Firecracker process will be killed on drop, explicit <code>stop()</code> is recommended.</li>
 </ul>
@@ -4660,7 +4703,7 @@ socket_poll_ms = 20
 # work_dir = "/path/to/firecracker-work"
 # Optional override; defaults to $AENV_HOME/logs/serial.
 # serial_dir = "/path/to/serial"
-# Optional; enables Firecracker's own logging when set to a non-empty level.
+# Optional; enables stdout/stderr capture and firecracker.log when non-empty.
 # log_level = "Info"
 
 [kernel]
@@ -4708,13 +4751,14 @@ directories. These directories include runtime sockets, symlinks, local
 logs, and writable OverlayBD upper layer data (<code>overlaybd/upper.data</code> and
 <code>overlaybd/upper.index</code>). Defaults to <code>$AENV_HOME/firecracker-work</code>.</li>
 <li><code>serial_dir</code>: Optional override for the persistent output directory.
-Serial output is written under a per-sandbox subdirectory and not removed
-by the sandbox. Defaults to <code>$AENV_HOME/logs/serial</code>.</li>
+When logging is enabled, serial output is written under a per-sandbox subdirectory
+and not removed by the sandbox. Defaults to <code>$AENV_HOME/logs/serial</code>.
+Setting this path alone does not enable logging.</li>
 <li><code>log_level</code>: Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>,
 <code>Debug</code>, <code>Trace</code>, case-insensitive). When set to a non-empty value,
-Firecracker’s own logging is enabled and written to a <code>firecracker.log</code>
-file in the sandbox’s log directory (the same directory used for serial
-output). If omitted or empty, Firecracker logging is disabled.</li>
+stdout/stderr capture and <code>firecracker.log</code> are enabled in the sandbox’s
+log directory. If omitted or empty, stdout/stderr are discarded and no log
+directories are created, unless explicit Rust capture destinations are set.</li>
 </ul>
 </li>
 <li>
@@ -5482,7 +5526,7 @@ network namespaces are missing</li>
 <tr><td>Inherited runtime layers</td><td>snapshot artifact dir <code>rootfs/inherited-layers/{index}/{source-file}</code></td><td>Snapshot-owned hard links or copies of inherited runtime-created lower suffixes</td><td>Removes dependence on previous managed snapshot or persisted sandbox artifact roots</td><td>Created during pause when inherited lowers come from the managed snapshot root or another sandbox/generation under the same persisted <code>artifacts</code> root.</td><td>No.</td></tr>
 <tr><td>Attached-drive snapshot dirs</td><td>snapshot artifact dir <code>drives/{drive_id}/...</code></td><td>Per-drive image config and snapshot layer</td><td>Captures writable attached-drive state</td><td>Created alongside rootfs snapshot for each drive.</td><td>No.</td></tr>
 <tr><td>Firecracker work dir</td><td>configured work root, or consumed pool tempfile dir</td><td>API socket, symlinks, runtime dirs, local logs</td><td>Firecracker CWD for a sandbox</td><td>Created when sandbox handle is built, or moved from a warm pool entry; removed by owning <code>TempDir</code>.</td><td>Yes, except live state.</td></tr>
-<tr><td>Firecracker serial logs</td><td><code>firecracker.serial_dir/{sandbox_id}/*</code>, or warm pool work dir logs</td><td>Firecracker stdout/stderr</td><td>Debugging</td><td>Opened on spawn and appended. Warm logs are relocated when a warm process is consumed. Configured serial output is not automatically GC’d.</td><td>No, but disposable.</td></tr>
+<tr><td>Firecracker serial logs</td><td><code>firecracker.serial_dir/{sandbox_id}/*</code>, or warm pool work dir logs</td><td>Firecracker stdout/stderr</td><td>Debugging</td><td>Opened on spawn and appended only when <code>firecracker.log_level</code> is non-empty or an explicit Rust capture destination is set. Enabled warm logs are relocated when a warm process is consumed. Configured serial output is not automatically GC’d.</td><td>No, but disposable.</td></tr>
 <tr><td>Firecracker logger output</td><td><code>firecracker.log</code> in the same per-sandbox log directory as the serial logs</td><td>Firecracker internal logger (<code>PUT /logger</code>)</td><td>Debugging</td><td>Only created when <code>firecracker.log_level</code> is set to a non-empty level. Written by Firecracker itself; not automatically GC’d.</td><td>No, but disposable.</td></tr>
 </tbody>
 </table>
@@ -5496,7 +5540,7 @@ network namespaces are missing</li>
 </thead>
 <tbody>
 <tr><td>Warm pool work dir</td><td>system tempfile dir</td><td>Firecracker socket and warm process logs</td><td>Pre-spawned Firecracker process CWD</td><td>Created by pool maintenance as a <code>TempDir</code>. Removed when warm entry is cleaned up, or moved into the consuming sandbox and later dropped there.</td></tr>
-<tr><td>Warm pool logs</td><td>warm pool work dir <code>firecracker-stdout.log</code>, <code>firecracker-stderr.log</code></td><td>Firecracker output before the warm process is consumed</td><td>Debugging warm startup</td><td>Created on warm spawn. Relocated into sandbox log path when consumed if no explicit stdout/stderr override.</td></tr>
+<tr><td>Warm pool logs</td><td>warm pool work dir <code>firecracker-stdout.log</code>, <code>firecracker-stderr.log</code></td><td>Firecracker output before the warm process is consumed</td><td>Debugging warm startup</td><td>Created on warm spawn only when <code>firecracker.log_level</code> is non-empty. Relocated into sandbox log path when consumed if no explicit stdout/stderr override.</td></tr>
 </tbody>
 </table>
 </div>
@@ -6125,6 +6169,7 @@ pub trait P2pTransport: Send + Sync {
 </li>
 <li>Overlaybd layers referenced by the snapshot’s rootfs, memory, and attached-drive image configs. These are not published under a snapshot-specific key. They reuse the overlaybd layer artifact protocol owned by <code>src/overlaybd/p2p/artifact.rs</code>, with keys like <code>overlaybd-layer/v1/sha256:&lt;digest&gt;</code> and <code>LayerMetadata</code> understood by the overlaybd HTTP facade.</li>
 </ul>
+<p>Digest-keyed layer publication is guarded against the committed record: a local layer is only advertised under <code>overlaybd-layer/v1/sha256:&lt;digest&gt;</code> when that digest is one the committed record references for the same subject (memory, rootfs, or the matching attached drive). When <code>[snapshot.publish_compression]</code> recontainerizes a raw local layer as ZFile during upload, the record names the compressed bytes, so the raw layer’s digest key is skipped rather than advertised under a key no consumer will look up. ZFile layers also carry no LSMT uuid (<code>uuid = None</code> in the committed record), so uuid-keyed acceleration never applies to recontainerized layers.</p>
 <p>That split is important. Snapshot fixed artifacts are scoped to one snapshot ID and are only consumed by snapshot runtime resolvers. Overlaybd commit layers are content-addressed and may be consumed by any overlaybd runtime path, including foreground range reads through <code>/p2p-http/{origin}</code>. Do not add a second snapshot-specific key format for overlaybd layers; doing so publishes bytes that overlaybd cannot discover.</p>
 <p>OSS snapshot resolution consumes fixed artifacts through P2P first:</p>
 <ul>
