@@ -50,6 +50,13 @@ socket_poll_ms = 1
 # Setting serial_dir alone does not enable logging.
 # log_level = "Info"
 
+# Hand the sandbox TAP queue to Firecracker as a pre-opened descriptor referenced
+# by an "fd:<fd>:<name>" host_dev_name spec, instead of letting Firecracker open
+# the interface by name inside the sandbox network namespace. Requires a
+# Firecracker build with fd: spec support; set to false when running an
+# unpatched binary.
+# preopen_tap = true
+
 [kernel]
 # Use an existing uncompressed Linux kernel image instead of downloading one.
 # The file must be a readable, non-empty regular file.

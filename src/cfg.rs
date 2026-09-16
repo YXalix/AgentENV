@@ -183,6 +183,13 @@ pub struct FirecrackerConfig {
     /// When set (non-empty), enables stdout/stderr capture and Firecracker logging
     /// to `firecracker.log` in the same directory. Unset/empty disables all three.
     pub log_level: Option<String>,
+    /// Hand the sandbox TAP queue to Firecracker as a pre-opened descriptor
+    /// referenced by an `fd:<fd>:<name>` `host_dev_name` spec, instead of
+    /// letting Firecracker open the interface by name inside the sandbox
+    /// network namespace. Requires a Firecracker build with `fd:` spec
+    /// support; set to false when running an unpatched binary.
+    #[config(default = true)]
+    pub preopen_tap: bool,
 }
 
 #[derive(Debug, Config, Clone)]

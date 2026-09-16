@@ -20,6 +20,8 @@ pub use config::{
     FirecrackerSnapshotConfig,
 };
 pub use factory::FirecrackerSandboxFactory;
-pub(super) use instance::FirecrackerInstance;
+pub(super) use instance::{
+    sandbox_host_dev_name, tap_handoff, FirecrackerInstance, SANDBOX_NET_IFACE_ID,
+};
 pub use pool::FirecrackerPool;
 pub use sandbox::{FirecrackerPausedState, FirecrackerSandbox};
