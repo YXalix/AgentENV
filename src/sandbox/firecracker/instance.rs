@@ -42,7 +42,7 @@ pub(crate) const SANDBOX_TAP_IFACE_NAME: &str = "tap0";
 const NET_TAP_FD: RawFd = 3;
 
 /// Hands Firecracker the sandbox TAP queue as a pre-opened descriptor (an
-/// `fd:<fd>:<name>` `host_dev_name` spec) instead of letting it open the
+/// `fd:`/`fdp:` `host_dev_name` spec) instead of letting it open the
 /// interface by name inside the sandbox network namespace.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TapHandoff<'a> {
@@ -51,12 +51,18 @@ pub(crate) struct TapHandoff<'a> {
     /// Raw descriptor of the slot-owned queue. The spawn hook only dups this
     /// number, so the owning slot must outlive the spawn call.
     pub queue_fd: RawFd,
+    /// Whether the queue was attached with its vnet header size preset
+    /// (`tap_queue_preconfigured`), selecting the `fdp:` spec under which
+    /// Firecracker trusts the preset and skips its TUNGETIFF validation and
+    /// TUNSETVNETHDRSZ configuration.
+    pub preconfigured: bool,
 }
 
 impl TapHandoff<'_> {
     /// The `host_dev_name` value that hands Firecracker the pre-opened queue.
     pub(crate) fn host_dev_name(&self) -> String {
-        format!("fd:{NET_TAP_FD}:{}", self.tap_name)
+        let spec = if self.preconfigured { "fdp" } else { "fd" };
+        format!("{spec}:{NET_TAP_FD}:{}", self.tap_name)
     }
 }
 
@@ -832,8 +838,19 @@ mod tests {
         let tap = TapHandoff {
             tap_name: "tap0",
             queue_fd: 7,
+            preconfigured: false,
         };
         assert_eq!(tap.host_dev_name(), "fd:3:tap0");
+
+        // The pre-configured variant must keep its own spec prefix: a
+        // Firecracker without fdp: support treats the whole string as an
+        // interface name and fails loudly instead of silently mis-parsing.
+        let tap = TapHandoff {
+            tap_name: "tap0",
+            queue_fd: 7,
+            preconfigured: true,
+        };
+        assert_eq!(tap.host_dev_name(), "fdp:3:tap0");
     }
 
     #[tokio::test]
@@ -873,6 +890,7 @@ mod tests {
                     Some(TapHandoff {
                         tap_name: "tap-hdoff-t",
                         queue_fd: queue.as_raw_fd(),
+                        preconfigured: false,
                     }),
                 )
                 .await?;

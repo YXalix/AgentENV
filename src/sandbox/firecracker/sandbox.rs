@@ -1424,10 +1424,10 @@ impl FirecrackerSandbox {
         self.launch.common().ublk_config.is_some()
     }
 
-    /// The `host_dev_name` for the sandbox interface: the `fd:` spec when the
-    /// network slot hands off its pre-opened queue, the plain tap name
-    /// otherwise. Derived from [`Slot::tap_handoff`] so it can never disagree
-    /// with the spawn-side fd handoff.
+    /// The `host_dev_name` for the sandbox interface: the `fd:`/`fdp:` spec
+    /// when the network slot hands off its pre-opened queue, the plain tap
+    /// name otherwise. Derived from [`Slot::tap_handoff`] so it can never
+    /// disagree with the spawn-side fd handoff.
     fn sandbox_host_dev_name(&self) -> String {
         self.network_slot
             .as_ref()

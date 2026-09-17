@@ -44,11 +44,21 @@ const NEIGH_SYSCTL_RETRY_DELAY_MS: u64 = 20;
 /// `_IOW('T', 202, int)`: attach this descriptor to a tun/tap queue.
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 
+/// `_IOW('T', 216, int)`: set the vnet header size of this queue.
+const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54d8;
+
 // Queue flags Firecracker opens TAP devices with; its `Tap::from_fd` rejects
 // pre-opened descriptors whose interface does not carry all three.
 const IFF_TAP: libc::c_short = 0x0002;
 const IFF_NO_PI: libc::c_short = 0x1000;
 const IFF_VNET_HDR: libc::c_short = 0x4000;
+
+/// The vnet header size Firecracker programs its TAP queues with
+/// (`vnet_hdr_len()` in its virtio-net device, the size of its
+/// `virtio_net_hdr_v1` binding). `tap_queue_preconfigured` presets this at
+/// attach so the `fdp:` spec consumer can skip its own TUNSETVNETHDRSZ.
+/// Must stay in sync with Firecracker; a mismatch corrupts frames silently.
+const FC_VNET_HDR_LEN: libc::c_int = 12;
 
 // Upper bounds for [`Slot::drain_tap_queue`]: 1024 reads of 64 KiB cap the
 // work spent on a queue that keeps receiving frames while being drained.
@@ -347,25 +357,40 @@ impl Slot {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("attach TAP queue to {tap_name}"));
         }
+        if crate::cfg::ConfigManager::global_config()
+            .firecracker
+            .tap_queue_preconfigured
+        {
+            // Paired with the `fdp:` host_dev_name spec: Firecracker trusts
+            // the preset and skips its own TUNSETVNETHDRSZ round trip.
+            let vnet_hdr_len = FC_VNET_HDR_LEN;
+            // SAFETY: `file` is an open tun descriptor. TUNSETVNETHDRSZ is
+            // `_IOW('T', 216, int)`: the kernel reads the size through a
+            // userspace pointer (get_user), so pass a reference, not the
+            // value itself — matching Firecracker's `ioctl_with_ref` call.
+            if (unsafe { libc::ioctl(file.as_raw_fd(), TUNSETVNETHDRSZ, &vnet_hdr_len) }) < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("preset vnet header size on TAP queue {tap_name}"));
+            }
+        }
         Ok(file.into())
     }
 
     /// The slot-owned TAP handoff for the next Firecracker spawn: enabled
     /// only when `firecracker.preopen_tap` is set and this slot actually
     /// holds a queue descriptor. This is the single decision point shared by
-    /// the spawn-side fd handoff and the `fd:` `host_dev_name` spec — never
-    /// decide the two separately.
+    /// the spawn-side fd handoff and the `fd:`/`fdp:` `host_dev_name` spec —
+    /// never decide the two separately.
     pub(crate) fn tap_handoff(&self) -> Option<TapHandoff<'_>> {
-        if !crate::cfg::ConfigManager::global_config()
-            .firecracker
-            .preopen_tap
-        {
+        let firecracker_config = &crate::cfg::ConfigManager::global_config().firecracker;
+        if !firecracker_config.preopen_tap {
             return None;
         }
         let queue_fd = self.tap_queue_fd.as_ref()?.as_raw_fd();
         Some(TapHandoff {
             tap_name: SANDBOX_TAP_IFACE_NAME,
             queue_fd,
+            preconfigured: firecracker_config.tap_queue_preconfigured,
         })
     }
 
@@ -1121,6 +1146,9 @@ fn parse_nameserver_ipv4(contents: &str) -> Option<Ipv4Addr> {
 mod tests {
     use super::*;
 
+    /// `_IOR('T', 215, int)`: read back a queue's vnet header size.
+    const TUNGETVNETHDRSZ: libc::c_ulong = 0x8004_54d7;
+
     fn test_slot(idx: u32, address_plan: NetworkAddressPlan) -> Result<Slot, NetworkError> {
         Slot::new(
             idx,
@@ -1346,6 +1374,24 @@ mod tests {
                 slot.tap_queue_fd.is_some(),
                 "slot must hold the attached TAP queue descriptor"
             );
+            if crate::cfg::ConfigManager::global_config()
+                .firecracker
+                .tap_queue_preconfigured
+            {
+                // The `fdp:` spec consumer trusts this preset; read it back.
+                let fd = slot.tap_queue_fd.as_ref().unwrap().as_raw_fd();
+                let mut hdr_len: libc::c_int = 0;
+                // SAFETY: `fd` is an attached tun queue descriptor and
+                // `hdr_len` a valid out-pointer.
+                let ret = unsafe { libc::ioctl(fd, TUNGETVNETHDRSZ, &mut hdr_len) };
+                assert_eq!(
+                    ret,
+                    0,
+                    "TUNGETVNETHDRSZ failed: {:?}",
+                    std::io::Error::last_os_error()
+                );
+                assert_eq!(hdr_len, FC_VNET_HDR_LEN, "vnet header size must be preset");
+            }
             slot.drain_tap_queue();
         } else {
             assert!(slot.tap_queue_fd.is_none());

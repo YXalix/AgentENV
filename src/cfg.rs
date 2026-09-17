@@ -191,6 +191,15 @@ pub struct FirecrackerConfig {
     /// false when running an unpatched binary.
     #[config(default = true)]
     pub preopen_tap: bool,
+    /// Preset the vnet header size on the pre-opened TAP queue at attach time
+    /// and hand it to Firecracker as an `fdp:<fd>:<name>` `host_dev_name`
+    /// spec, which trusts the pre-configured queue and skips Firecracker's
+    /// TUNGETIFF validation and TUNSETVNETHDRSZ configuration. Requires a
+    /// Firecracker build with `fdp:` spec support (newer than `fd:` support);
+    /// keep false until the bundled Firecracker binary is upgraded. Only
+    /// meaningful together with `preopen_tap`.
+    #[config(default = false)]
+    pub tap_queue_preconfigured: bool,
 }
 
 #[derive(Debug, Config, Clone)]

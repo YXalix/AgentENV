@@ -58,6 +58,15 @@ socket_poll_ms = 1
 # unpatched binary.
 # preopen_tap = true
 
+# Preset the vnet header size on the pre-opened TAP queue at attach time and
+# hand it to Firecracker as an "fdp:<fd>:<name>" host_dev_name spec, which
+# trusts the pre-configured queue and skips Firecracker's TUNGETIFF
+# validation and TUNSETVNETHDRSZ configuration. Requires a Firecracker build
+# with fdp: spec support (a newer build than fd: support); keep disabled until
+# the bundled Firecracker binary is upgraded. Only meaningful together with
+# preopen_tap.
+# tap_queue_preconfigured = false
+
 [kernel]
 # Use an existing uncompressed Linux kernel image instead of downloading one.
 # The file must be a readable, non-empty regular file.
