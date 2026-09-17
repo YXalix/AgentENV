@@ -22,7 +22,7 @@ use super::overlaybd_snapshot::{
     restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
 };
 use super::pool::{warm_stdio_paths, FirecrackerPool};
-use super::FirecrackerInstance;
+use super::{FirecrackerInstance, SANDBOX_NET_IFACE_ID, SANDBOX_TAP_IFACE_NAME};
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
@@ -1424,6 +1424,18 @@ impl FirecrackerSandbox {
         self.launch.common().ublk_config.is_some()
     }
 
+    /// The `host_dev_name` for the sandbox interface: the `fdp:` spec
+    /// when the network slot hands off its pre-opened queue, the plain tap
+    /// name otherwise. Derived from [`Slot::tap_handoff`] so it can never
+    /// disagree with the spawn-side fd handoff.
+    fn sandbox_host_dev_name(&self) -> String {
+        self.network_slot
+            .as_ref()
+            .and_then(Slot::tap_handoff)
+            .map(|tap| tap.host_dev_name())
+            .unwrap_or_else(|| SANDBOX_TAP_IFACE_NAME.to_string())
+    }
+
     fn mmds_metadata(&self, common: &FirecrackerCommonConfig) -> MmdsMetadata {
         common
             .mmds_metadata
@@ -1789,9 +1801,11 @@ impl FirecrackerSandbox {
         boot_args =
             add_damon_monitor_region(boot_args, config.mem_size_mib, std::env::consts::ARCH);
 
-        // ── Spawn Firecracker inside the network namespace so it can access tap0 ──
+        // ── Spawn Firecracker inside the network namespace, handing it the
+        // slot-owned tap0 queue as a descriptor ──
         let firecracker_binary = config.common.firecracker_binary.clone();
         let (stdout_path, stderr_path) = self.firecracker_stdio_paths();
+        let tap = self.network_slot.as_ref().and_then(Slot::tap_handoff);
 
         self.fc_instance
             .spawn_with_netns(
@@ -1799,6 +1813,7 @@ impl FirecrackerSandbox {
                 stdout_path.as_deref(),
                 stderr_path.as_deref(),
                 Some(&netns),
+                tap,
             )
             .await?;
 
@@ -1867,7 +1882,12 @@ impl FirecrackerSandbox {
                     "using warm firecracker from pool"
                 );
 
-                self.network_slot = Some(warm.slot);
+                let mut slot = warm.slot;
+                // The warm Firecracker held fd 3 but never read while pooled,
+                // and this path bypasses `NetworkManager::release`, so drain
+                // the shared queue here for the restored guest.
+                slot.drain_tap_queue();
+                self.network_slot = Some(slot);
                 self.work_dir = warm.work_dir; // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
                 let _cold = std::mem::replace(&mut self.fc_instance, warm.fc_instance);
                 if let Err(err) =
@@ -1996,6 +2016,7 @@ impl FirecrackerSandbox {
                     stdout_path.as_deref(),
                     stderr_path.as_deref(),
                     Some(&netns),
+                    self.network_slot.as_ref().and_then(Slot::tap_handoff),
                 )
                 .await?;
 
@@ -2063,7 +2084,10 @@ impl FirecrackerSandbox {
         self.configure_logger(&config.common).await?;
 
         // Override the network interface to use the new tap0 in our namespace
-        let network_overrides = [("eth0", "tap0")];
+        let network_overrides = [(
+            SANDBOX_NET_IFACE_ID.to_string(),
+            self.sandbox_host_dev_name(),
+        )];
         self.fc_instance
             .load_snapshot_file(
                 &vm_state_src,
@@ -2279,13 +2303,19 @@ impl FirecrackerSandbox {
         if self.network_slot.is_some() {
             // Network interface.
             self.fc_instance
-                .add_network_interface("eth0", None, "tap0".to_string(), None, None)
+                .add_network_interface(
+                    SANDBOX_NET_IFACE_ID,
+                    None,
+                    self.sandbox_host_dev_name(),
+                    None,
+                    None,
+                )
                 .await
                 .context("Failed to add network interface to microVM")?;
 
             // MMDS
             self.fc_instance
-                .set_mmds_config("eth0")
+                .set_mmds_config(SANDBOX_NET_IFACE_ID)
                 .await
                 .context("Failed to set MMDS network configuration")?;
             let mmds_metadata = self.mmds_metadata(&config.common);
@@ -2759,6 +2789,7 @@ mod tests {
                             stdout.as_deref(),
                             stderr.as_deref(),
                             None,
+                            None,
                         )
                         .await?;
                     sandbox
@@ -2811,6 +2842,7 @@ mod tests {
                     Path::new("/bin/echo"),
                     stdout.as_deref(),
                     stderr.as_deref(),
+                    None,
                     None,
                 )
                 .await?;

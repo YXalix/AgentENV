@@ -1,4 +1,5 @@
 use std::io;
+use std::os::unix::process::CommandExt;
 use std::thread;
 use std::time::Duration;
 
@@ -78,6 +79,12 @@ where
     })
 }
 
+/// A hook run in the forked child between `fork` and `execve`.
+///
+/// The hook must be async-signal-safe: raw syscalls on stack memory only, no
+/// allocation, locking, or formatting. Prepare any buffers before returning it.
+pub type ChildSetupHook = Box<dyn FnMut() -> io::Result<()> + Send + Sync + 'static>;
+
 /// Spawn a Tokio command from a short-lived thread with an exact capability set.
 ///
 /// `before_capability_scope` runs on the launcher thread before its capabilities
@@ -85,10 +92,35 @@ where
 /// launcher thread then scopes its capabilities and uses the normal command
 /// spawn path, so the multi-threaded server process does not need a `pre_exec`
 /// hook and remains eligible for `posix_spawn`.
+///
+/// Equivalent to [`spawn_command_scoped`] without a child setup hook.
 pub async fn spawn_tokio_command_scoped<F>(
+    command: tokio::process::Command,
+    capabilities: &'static [i32],
+    before_capability_scope: F,
+) -> io::Result<tokio::process::Child>
+where
+    F: FnOnce() -> io::Result<()> + Send + 'static,
+{
+    spawn_command_scoped(command, capabilities, before_capability_scope, None).await
+}
+
+/// Spawn a Tokio command from a short-lived thread with an exact capability
+/// set, optionally running a hook in the forked child between `fork` and
+/// `execve`.
+///
+/// Behaves like [`spawn_tokio_command_scoped`]; `child_setup`, when present,
+/// runs as a `pre_exec` hook: after `fork`, with the launcher thread's
+/// namespaces and the scoped capability set, right before `execve` — for
+/// example to dup the network slot's TAP queue onto the fixed descriptor
+/// Firecracker inherits and clear `FD_CLOEXEC` on the copy. Registering a
+/// hook forfeits `posix_spawn` eligibility for this spawn; leave it `None`
+/// for spawns that do not need it.
+pub async fn spawn_command_scoped<F>(
     mut command: tokio::process::Command,
     capabilities: &'static [i32],
     before_capability_scope: F,
+    child_setup: Option<ChildSetupHook>,
 ) -> io::Result<tokio::process::Child>
 where
     F: FnOnce() -> io::Result<()> + Send + 'static,
@@ -106,6 +138,15 @@ where
             let result = (|| {
                 before_capability_scope()?;
                 linux_cap::configure_current_process_capabilities(capabilities)?;
+
+                if let Some(child_setup) = child_setup {
+                    // SAFETY: The hook only performs raw syscalls on stack
+                    // memory, so it is async-signal-safe between `fork` and
+                    // `exec`.
+                    unsafe {
+                        command.as_std_mut().pre_exec(child_setup);
+                    }
+                }
 
                 let _runtime_guard = runtime.enter();
                 command.kill_on_drop(true);
@@ -213,6 +254,42 @@ mod tests {
         let sets = linux_cap::CapabilitySets::from_proc_status(status).unwrap();
         assert!(sets.is_delegable(CAP_NET_ADMIN).unwrap());
         assert!(!sets.is_delegable(CAP_SYS_ADMIN).unwrap());
+    }
+
+    #[tokio::test]
+    async fn scoped_spawn_runs_child_setup_hook_before_exec() -> Result<()> {
+        let temp = tempdir()?;
+        let marker = temp.path().join("marker");
+        fs::write(&marker, b"marker")?;
+        let marker_path = marker.to_string_lossy().into_owned();
+        let marker_c = std::ffi::CString::new(marker_path.clone()).unwrap();
+
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "readlink /proc/self/fd/3"])
+            .stdout(Stdio::piped());
+
+        // Async-signal-safe like the real hook: raw syscalls, prepared buffers.
+        let hook: ChildSetupHook = Box::new(move || {
+            let fd = unsafe { libc::open(marker_c.as_ptr(), libc::O_RDONLY) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if fd != 3 {
+                if unsafe { libc::dup2(fd, 3) } < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                unsafe { libc::close(fd) };
+            }
+            Ok(())
+        });
+
+        let child = spawn_command_scoped(command, &[], || Ok(()), Some(hook)).await?;
+        let output = child.wait_with_output().await?;
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout)?.trim(), marker_path);
+        Ok(())
     }
 
     #[tokio::test]
