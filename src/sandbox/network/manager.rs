@@ -240,11 +240,14 @@ impl NetworkManager {
         }
 
         // Fast path: reuse a warm slot from the pool.
-        if let Some(slot) = self.pool.try_acquire() {
+        if let Some(mut slot) = self.pool.try_acquire() {
             if self.shutting_down() {
                 let _ = self.cleanup_slot_and_release_bit(slot);
                 return Err(anyhow!(ERR_SHUTTING_DOWN));
             }
+            // The slot may have received stray frames while pooled (the host
+            // route to its interaction IP persists); drain before reuse.
+            slot.drain_tap_queue();
             debug!(slot = slot.idx, "reused warm network slot from pool");
             if self.pool.len() < self.pool.config().low_watermark {
                 self.pool.request_maintenance();
@@ -366,10 +369,13 @@ impl NetworkManager {
     ///
     /// When pool maintenance is disabled, this keeps the previous bounded-pool
     /// behavior and cleans up immediately once the pool reaches high watermark.
-    pub fn release(&self, slot: Slot) -> Result<()> {
+    pub fn release(&self, mut slot: Slot) -> Result<()> {
         if self.shutting_down() {
             return self.cleanup_slot_and_release_bit(slot);
         }
+        // Discard frames that arrived while the sandbox was live: the next
+        // tenant of this pooled slot must not observe them.
+        slot.drain_tap_queue();
         let slot_idx = slot.idx;
         match self.pool.release(slot) {
             Ok(()) => {

@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
@@ -39,6 +40,20 @@ const ARP_RETRANS_TIME_MS: &str = "100";
 const NEIGH_SYSCTL_RETRIES: usize = 5;
 const NEIGH_SYSCTL_RETRY_DELAY_MS: u64 = 20;
 
+/// `_IOW('T', 202, int)`: attach this descriptor to a tun/tap queue.
+const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+
+// Queue flags Firecracker opens TAP devices with; its `Tap::from_fd` rejects
+// pre-opened descriptors whose interface does not carry all three.
+const IFF_TAP: libc::c_short = 0x0002;
+const IFF_NO_PI: libc::c_short = 0x1000;
+const IFF_VNET_HDR: libc::c_short = 0x4000;
+
+// Upper bounds for [`Slot::drain_tap_queue`]: 1024 reads of 64 KiB cap the
+// work spent on a queue that keeps receiving frames while being drained.
+const TAP_DRAIN_MAX_READS: usize = 1024;
+const TAP_DRAIN_BUF_SIZE: usize = 64 * 1024;
+
 /// Get a borrowed reference to the host network namespace fd.
 pub(super) fn host_ns_fd() -> BorrowedFd<'static> {
     HOST_NS_FD
@@ -65,6 +80,14 @@ pub(crate) struct Slot {
     /// Warm-pool reuse preserves the namespace, so the next tenant may need to
     /// clear rules left by the previous tenant.
     user_egress_rules_present: bool,
+    /// Queue descriptor attached to this namespace's persistent tap0 while
+    /// `firecracker.preopen_tap` is enabled. The descriptor keeps the queue
+    /// (and with it the network namespace) alive across Firecracker process
+    /// restarts, so teardown costs no tun ioctls. It is dropped together with
+    /// the slot after `cleanup()` has run: cleanup removes the namespace file
+    /// and veth, and the namespace itself only goes away once this last
+    /// reference closes.
+    tap_queue_fd: Option<OwnedFd>,
 }
 
 struct NamespaceSetup {
@@ -112,6 +135,7 @@ impl Slot {
             egress_proxy,
             cleanup_armed: false,
             user_egress_rules_present: false,
+            tap_queue_fd: None,
         })
     }
 
@@ -156,13 +180,14 @@ impl Slot {
         // Spawn a thread to perform namespace operations safely.
         let handle = thread::spawn(move || Self::setup_namespace_internal(setup, host_ns_fd));
 
-        match handle.join() {
+        let tap_queue_fd = match handle.join() {
             Ok(result) => result.map_err(NetworkError::NamespaceError),
             Err(e) => Err(NetworkError::NamespaceError(anyhow!(
                 "Network setup thread panicked: {:?}",
                 e
             ))),
         }?;
+        self.tap_queue_fd = tap_queue_fd;
 
         // Configure the Host side now.
         Self::run_async(move || {
@@ -199,7 +224,7 @@ impl Slot {
     fn setup_namespace_internal(
         setup: NamespaceSetup,
         host_ns_fd: BorrowedFd<'static>,
-    ) -> Result<()> {
+    ) -> Result<Option<OwnedFd>> {
         let NamespaceSetup {
             idx,
             namespace_id,
@@ -269,7 +294,100 @@ impl Slot {
             veth_vm_ip,
             address_plan.vm_ip(),
             &address_plan.internal_egress_denied_cidrs(),
-        )
+        )?;
+
+        // Attach the slot-owned TAP queue last, still inside this namespace:
+        // TUNSETIFF resolves the interface by name, so it must run where the
+        // interface lives. Once attached, the queue is usable from any thread.
+        let tap_queue_fd = if crate::cfg::ConfigManager::global_config()
+            .firecracker
+            .preopen_tap
+        {
+            Some(Self::attach_tap_queue("tap0")?)
+        } else {
+            None
+        };
+
+        Ok(tap_queue_fd)
+    }
+
+    /// Attaches a queue to the named persistent TAP interface and returns the
+    /// descriptor. Must run inside the network namespace that owns the
+    /// interface. The flags match what Firecracker expects of a pre-opened
+    /// queue descriptor, and attaching matches the interface owner rather
+    /// than requiring capabilities.
+    fn attach_tap_queue(tap_name: &str) -> Result<OwnedFd> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            // O_CLOEXEC keeps the descriptor out of unrelated children exec'd
+            // by this process; spawns handing it to Firecracker dup it
+            // explicitly. O_NONBLOCK lets the queue be drained cheaply.
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open("/dev/net/tun")
+            .context("open /dev/net/tun")?;
+        let bytes = tap_name.as_bytes();
+        anyhow::ensure!(
+            !bytes.is_empty() && bytes.len() < libc::IFNAMSIZ,
+            "tap interface name {tap_name:?} must be 1 to {} bytes",
+            libc::IFNAMSIZ - 1
+        );
+        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                ifr.ifr_name.as_mut_ptr().cast(),
+                bytes.len(),
+            );
+            ifr.ifr_ifru.ifru_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR;
+        }
+        // SAFETY: `file` is an open tun descriptor and `ifr` a valid request.
+        if (unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF, &mut ifr) }) < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("attach TAP queue to {tap_name}"));
+        }
+        Ok(file.into())
+    }
+
+    /// Discards frames queued while the slot was live or pooled so the next
+    /// tenant never reads the previous lifecycle's traffic. All descriptors
+    /// of the queue share one socket, so draining through this slot's
+    /// descriptor also clears what a parked warm Firecracker would later feed
+    /// to a restored guest. Best-effort: errors are logged and ignored.
+    pub(super) fn drain_tap_queue(&mut self) {
+        let Some(queue) = self.tap_queue_fd.as_ref() else {
+            return;
+        };
+        let fd = queue.as_raw_fd();
+        let mut scratch = [0u8; TAP_DRAIN_BUF_SIZE];
+        for _ in 0..TAP_DRAIN_MAX_READS {
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll_fd` is a valid single-element pollfd array.
+            if unsafe { libc::poll(&mut poll_fd, 1, 0) } <= 0 {
+                return;
+            }
+            // SAFETY: `fd` is an open descriptor and `scratch` bounds the
+            // write.
+            let read_bytes = unsafe { libc::read(fd, scratch.as_mut_ptr().cast(), scratch.len()) };
+            if read_bytes <= 0 {
+                if read_bytes < 0 {
+                    debug!(
+                        slot = self.idx,
+                        error = %std::io::Error::last_os_error(),
+                        "failed to read while draining tap queue"
+                    );
+                }
+                return;
+            }
+        }
+        debug!(
+            slot = self.idx,
+            "tap queue still readable after drain limit; leaving remaining frames"
+        );
     }
 
     /// Configures all network interfaces inside the namespace:
@@ -1159,6 +1277,14 @@ mod tests {
     }
 
     #[test]
+    fn drain_tap_queue_is_noop_without_attached_queue() {
+        let mut slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
+        // create_network never ran, so the slot holds no queue descriptor.
+        assert!(slot.tap_queue_fd.is_none());
+        slot.drain_tap_queue();
+    }
+
+    #[test]
     #[ignore = "requires CAP_NET_ADMIN/CAP_SYS_ADMIN and affects system configuration"]
     fn test_network_lifecycle() {
         crate::logging::init_for_tests();
@@ -1180,6 +1306,21 @@ mod tests {
                 }
                 panic!("Failed to create network: {:?}", e);
             }
+        }
+
+        // 1b. The slot owns an attached TAP queue exactly when creation
+        // succeeded and preopen_tap is enabled.
+        if crate::cfg::ConfigManager::global_config()
+            .firecracker
+            .preopen_tap
+        {
+            assert!(
+                slot.tap_queue_fd.is_some(),
+                "slot must hold the attached TAP queue descriptor"
+            );
+            slot.drain_tap_queue();
+        } else {
+            assert!(slot.tap_queue_fd.is_none());
         }
 
         // 2. Verify Namespace File
