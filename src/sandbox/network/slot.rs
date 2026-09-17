@@ -29,6 +29,7 @@ use super::policy::{
     initialize_namespace_egress_chain, set_namespace_egress_policy, SandboxNetworkPolicy,
 };
 use super::{NetworkAddressPlan, NetworkError, HOST_VETH_PREFIX, MAX_SLOTS, NETNS_PREFIX};
+use crate::sandbox::firecracker::{TapHandoff, SANDBOX_TAP_IFACE_NAME};
 
 /// Process-wide baseline network namespace fd.
 ///
@@ -316,7 +317,7 @@ impl Slot {
     /// interface. The flags match what Firecracker expects of a pre-opened
     /// queue descriptor, and attaching matches the interface owner rather
     /// than requiring capabilities.
-    fn attach_tap_queue(tap_name: &str) -> Result<OwnedFd> {
+    pub(crate) fn attach_tap_queue(tap_name: &str) -> Result<OwnedFd> {
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -349,12 +350,31 @@ impl Slot {
         Ok(file.into())
     }
 
+    /// The slot-owned TAP handoff for the next Firecracker spawn: enabled
+    /// only when `firecracker.preopen_tap` is set and this slot actually
+    /// holds a queue descriptor. This is the single decision point shared by
+    /// the spawn-side fd handoff and the `fd:` `host_dev_name` spec — never
+    /// decide the two separately.
+    pub(crate) fn tap_handoff(&self) -> Option<TapHandoff<'_>> {
+        if !crate::cfg::ConfigManager::global_config()
+            .firecracker
+            .preopen_tap
+        {
+            return None;
+        }
+        let queue_fd = self.tap_queue_fd.as_ref()?.as_raw_fd();
+        Some(TapHandoff {
+            tap_name: SANDBOX_TAP_IFACE_NAME,
+            queue_fd,
+        })
+    }
+
     /// Discards frames queued while the slot was live or pooled so the next
     /// tenant never reads the previous lifecycle's traffic. All descriptors
     /// of the queue share one socket, so draining through this slot's
     /// descriptor also clears what a parked warm Firecracker would later feed
     /// to a restored guest. Best-effort: errors are logged and ignored.
-    pub(super) fn drain_tap_queue(&mut self) {
+    pub(crate) fn drain_tap_queue(&mut self) {
         let Some(queue) = self.tap_queue_fd.as_ref() else {
             return;
         };
@@ -1282,6 +1302,14 @@ mod tests {
         // create_network never ran, so the slot holds no queue descriptor.
         assert!(slot.tap_queue_fd.is_none());
         slot.drain_tap_queue();
+    }
+
+    #[test]
+    fn tap_handoff_requires_attached_queue() {
+        let slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
+        // No queue was attached (create_network never ran), so even with
+        // `preopen_tap` enabled there is nothing to hand off.
+        assert!(slot.tap_handoff().is_none());
     }
 
     #[test]

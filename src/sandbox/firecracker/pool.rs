@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 use warm_pool::{PoolMaintenanceAction, WarmPool};
 
 use super::config::{create_firecracker_work_dir, logging_enabled};
-use super::{tap_handoff, FirecrackerInstance};
+use super::FirecrackerInstance;
 use crate::cfg::{ConfigManager, ResolvedFirecrackerPoolConfig};
 use crate::sandbox::network::{NetworkManager, Slot};
 
@@ -318,7 +318,7 @@ impl FirecrackerPool {
                     stdout_path.as_deref(),
                     stderr_path.as_deref(),
                     Some(&slot.namespace_path()),
-                    tap_handoff(),
+                    slot.tap_handoff(),
                 )
                 .await
                 .context("spawn warm firecracker process")?;

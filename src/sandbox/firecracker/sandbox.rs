@@ -22,7 +22,7 @@ use super::overlaybd_snapshot::{
     restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
 };
 use super::pool::{warm_stdio_paths, FirecrackerPool};
-use super::{sandbox_host_dev_name, tap_handoff, FirecrackerInstance, SANDBOX_NET_IFACE_ID};
+use super::{FirecrackerInstance, SANDBOX_NET_IFACE_ID, SANDBOX_TAP_IFACE_NAME};
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
@@ -1424,6 +1424,18 @@ impl FirecrackerSandbox {
         self.launch.common().ublk_config.is_some()
     }
 
+    /// The `host_dev_name` for the sandbox interface: the `fd:` spec when the
+    /// network slot hands off its pre-opened queue, the plain tap name
+    /// otherwise. Derived from [`Slot::tap_handoff`] so it can never disagree
+    /// with the spawn-side fd handoff.
+    fn sandbox_host_dev_name(&self) -> String {
+        self.network_slot
+            .as_ref()
+            .and_then(Slot::tap_handoff)
+            .map(|tap| tap.host_dev_name())
+            .unwrap_or_else(|| SANDBOX_TAP_IFACE_NAME.to_string())
+    }
+
     fn mmds_metadata(&self, common: &FirecrackerCommonConfig) -> MmdsMetadata {
         common
             .mmds_metadata
@@ -1790,9 +1802,10 @@ impl FirecrackerSandbox {
             add_damon_monitor_region(boot_args, config.mem_size_mib, std::env::consts::ARCH);
 
         // ── Spawn Firecracker inside the network namespace, handing it the
-        // pre-opened tap0 queue as a descriptor ──
+        // slot-owned tap0 queue as a descriptor ──
         let firecracker_binary = config.common.firecracker_binary.clone();
         let (stdout_path, stderr_path) = self.firecracker_stdio_paths();
+        let tap = self.network_slot.as_ref().and_then(Slot::tap_handoff);
 
         self.fc_instance
             .spawn_with_netns(
@@ -1800,7 +1813,7 @@ impl FirecrackerSandbox {
                 stdout_path.as_deref(),
                 stderr_path.as_deref(),
                 Some(&netns),
-                tap_handoff(),
+                tap,
             )
             .await?;
 
@@ -1870,6 +1883,13 @@ impl FirecrackerSandbox {
                 );
 
                 self.network_slot = Some(warm.slot);
+                // The warm Firecracker held fd 3 but never read while pooled,
+                // and this path bypasses `NetworkManager::release`, so drain
+                // the shared queue here for the restored guest.
+                self.network_slot
+                    .as_mut()
+                    .expect("warm slot was just assigned")
+                    .drain_tap_queue();
                 self.work_dir = warm.work_dir; // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
                 let _cold = std::mem::replace(&mut self.fc_instance, warm.fc_instance);
                 if let Err(err) =
@@ -1998,7 +2018,7 @@ impl FirecrackerSandbox {
                     stdout_path.as_deref(),
                     stderr_path.as_deref(),
                     Some(&netns),
-                    tap_handoff(),
+                    self.network_slot.as_ref().and_then(Slot::tap_handoff),
                 )
                 .await?;
 
@@ -2066,7 +2086,10 @@ impl FirecrackerSandbox {
         self.configure_logger(&config.common).await?;
 
         // Override the network interface to use the new tap0 in our namespace
-        let network_overrides = [(SANDBOX_NET_IFACE_ID.to_string(), sandbox_host_dev_name())];
+        let network_overrides = [(
+            SANDBOX_NET_IFACE_ID.to_string(),
+            self.sandbox_host_dev_name(),
+        )];
         self.fc_instance
             .load_snapshot_file(
                 &vm_state_src,
@@ -2285,7 +2308,7 @@ impl FirecrackerSandbox {
                 .add_network_interface(
                     SANDBOX_NET_IFACE_ID,
                     None,
-                    sandbox_host_dev_name(),
+                    self.sandbox_host_dev_name(),
                     None,
                     None,
                 )

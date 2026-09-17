@@ -21,7 +21,7 @@ pub use config::{
 };
 pub use factory::FirecrackerSandboxFactory;
 pub(super) use instance::{
-    sandbox_host_dev_name, tap_handoff, FirecrackerInstance, SANDBOX_NET_IFACE_ID,
+    FirecrackerInstance, TapHandoff, SANDBOX_NET_IFACE_ID, SANDBOX_TAP_IFACE_NAME,
 };
 pub use pool::FirecrackerPool;
 pub use sandbox::{FirecrackerPausedState, FirecrackerSandbox};
