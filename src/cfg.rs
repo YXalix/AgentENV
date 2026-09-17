@@ -183,11 +183,12 @@ pub struct FirecrackerConfig {
     /// When set (non-empty), enables stdout/stderr capture and Firecracker logging
     /// to `firecracker.log` in the same directory. Unset/empty disables all three.
     pub log_level: Option<String>,
-    /// Hand the sandbox TAP queue to Firecracker as a pre-opened descriptor
-    /// referenced by an `fd:<fd>:<name>` `host_dev_name` spec, instead of
-    /// letting Firecracker open the interface by name inside the sandbox
-    /// network namespace. Requires a Firecracker build with `fd:` spec
-    /// support; set to false when running an unpatched binary.
+    /// Pre-open the sandbox TAP queue when the network slot is created and
+    /// hold the descriptor for the slot's lifetime. Spawns hand the queue to
+    /// Firecracker as an `fd:<fd>:<name>` `host_dev_name` spec (a plain dup
+    /// in the child), so pausing or exiting Firecracker never detaches the
+    /// queue. Requires a Firecracker build with `fd:` spec support; set to
+    /// false when running an unpatched binary.
     #[config(default = true)]
     pub preopen_tap: bool,
 }

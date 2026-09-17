@@ -50,9 +50,10 @@ socket_poll_ms = 1
 # Setting serial_dir alone does not enable logging.
 # log_level = "Info"
 
-# Hand the sandbox TAP queue to Firecracker as a pre-opened descriptor referenced
-# by an "fd:<fd>:<name>" host_dev_name spec, instead of letting Firecracker open
-# the interface by name inside the sandbox network namespace. Requires a
+# Pre-open the sandbox TAP queue when the network slot is created and hold the
+# descriptor for the slot's lifetime. Spawns hand the queue to Firecracker as
+# an "fd:<fd>:<name>" host_dev_name spec (a plain dup in the child), so
+# pausing or exiting Firecracker never detaches the queue. Requires a
 # Firecracker build with fd: spec support; set to false when running an
 # unpatched binary.
 # preopen_tap = true
