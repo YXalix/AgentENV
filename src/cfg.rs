@@ -183,6 +183,16 @@ pub struct FirecrackerConfig {
     /// When set (non-empty), Firecracker logging is enabled and written to a
     /// `firecracker.log` file in the same directory as the Firecracker stdout log.
     pub log_level: Option<String>,
+    /// Pre-open the sandbox TAP queue when the network slot is created and
+    /// hold the descriptor for the slot's lifetime. The queue is attached
+    /// with its vnet header size preset, and spawns hand it to Firecracker
+    /// as an `fdp:<fd>:<name>` `host_dev_name` spec (a plain dup in the
+    /// child), so pausing or exiting Firecracker never detaches the queue
+    /// and Firecracker skips its validation and vnet-header configuration
+    /// ioctls. Requires a Firecracker build with `fdp:` spec support; set
+    /// to false when running an unpatched binary.
+    #[config(default = true)]
+    pub preopen_tap: bool,
 }
 
 #[derive(Debug, Config, Clone)]

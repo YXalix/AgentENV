@@ -21,7 +21,9 @@ pub use config::{
     FirecrackerSnapshotConfig,
 };
 pub use factory::FirecrackerSandboxFactory;
-pub(super) use instance::FirecrackerInstance;
+pub(super) use instance::{
+    FirecrackerInstance, TapHandoff, SANDBOX_NET_IFACE_ID, SANDBOX_TAP_IFACE_NAME,
+};
 pub use manifest::FirecrackerSnapshotManifest;
 pub use pool::FirecrackerPool;
 pub use sandbox::{FirecrackerCapturedSnapshot, FirecrackerPausedState, FirecrackerSandbox};

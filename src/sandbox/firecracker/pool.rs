@@ -313,6 +313,7 @@ impl FirecrackerPool {
                     Some(&stdout_path),
                     Some(&stderr_path),
                     Some(&slot.namespace_path()),
+                    slot.tap_handoff(),
                 )
                 .await
                 .context("spawn warm firecracker process")?;
