@@ -47,6 +47,9 @@ const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
 /// `_IOW('T', 216, int)`: set the vnet header size of this queue.
 const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54d8;
 
+/// `_IOW('T', 208, c_uint)`: set the offload features of this queue.
+const TUNSETOFFLOAD: libc::c_ulong = 0x4004_54d0;
+
 // Queue flags the slot attaches the TAP queue with; they are the contract the
 // `fdp:` spec consumer (Firecracker) trusts without validation.
 const IFF_TAP: libc::c_short = 0x0002;
@@ -59,6 +62,16 @@ const IFF_VNET_HDR: libc::c_short = 0x4000;
 /// consumer can skip its own TUNSETVNETHDRSZ. Must stay in sync with
 /// Firecracker; a mismatch corrupts frames silently.
 const FC_VNET_HDR_LEN: libc::c_int = 12;
+
+/// TAP offload flags preset on attach: `TUN_F_CSUM | TUN_F_TSO4 |
+/// TUN_F_TSO6` — exactly what every standard Linux guest negotiates with
+/// Firecracker's virtio-net. Presetting lets the `fdp:` spec consumer skip
+/// its own TUNSETOFFLOAD at activate when the guest acked this set, taking
+/// the last tun ioctl (an rtnl round trip under the global kernel lock)
+/// off the snapshot-resume hot path. Must stay in sync with Firecracker's
+/// `LAUNCHER_PRESET_OFFLOAD`; a Firecracker that still programs offload
+/// unconditionally just overwrites this with the negotiated set.
+const FC_TAP_OFFLOAD_PRESET: libc::c_uint = 0x01 | 0x02 | 0x04 | 0x10;
 
 // Upper bounds for [`Slot::drain_tap_queue`]: 1024 reads of 64 KiB cap the
 // work spent on a queue that keeps receiving frames while being drained.
@@ -324,9 +337,10 @@ impl Slot {
 
     /// Attaches a queue to the named persistent TAP interface and returns the
     /// descriptor. Must run inside the network namespace that owns the
-    /// interface. The queue is attached with the flags and vnet header size
-    /// Firecracker trusts under the `fdp:` spec, and attaching matches the
-    /// interface owner rather than requiring capabilities.
+    /// interface. The queue is attached with the flags, vnet header size, and
+    /// offload features Firecracker trusts under the `fdp:` spec, and
+    /// attaching matches the interface owner rather than requiring
+    /// capabilities.
     pub(crate) fn attach_tap_queue(tap_name: &str) -> Result<OwnedFd> {
         let file = fs::OpenOptions::new()
             .read(true)
@@ -364,6 +378,15 @@ impl Slot {
         if (unsafe { libc::ioctl(file.as_raw_fd(), TUNSETVNETHDRSZ, &FC_VNET_HDR_LEN) }) < 0 {
             return Err(std::io::Error::last_os_error())
                 .with_context(|| format!("preset vnet header size on TAP queue {tap_name}"));
+        }
+        // SAFETY: `file` is an open tun descriptor. TUNSETOFFLOAD is
+        // `_IOW('T', 208, c_uint)` but the kernel consumes the flags from
+        // the ioctl argument value itself (`set_offload(tun, arg)`), so
+        // pass the value, not a reference — matching Firecracker's
+        // `ioctl_with_val` call.
+        if (unsafe { libc::ioctl(file.as_raw_fd(), TUNSETOFFLOAD, FC_TAP_OFFLOAD_PRESET) }) < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("preset offload on TAP queue {tap_name}"));
         }
         Ok(file.into())
     }
