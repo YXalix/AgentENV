@@ -55,6 +55,7 @@
 
 - [System Architecture](./internals/architecture.md)
 - [Sandbox Network Architecture](./internals/networking.md)
+- [TAP fd Slot Ownership](./internals/tap-fd-slot-ownership-design.md)
 - [Sandbox Internals and Testing](./internals/sandbox-testing.md)
 - [Template Builder and Testing](./internals/template-builder-testing.md)
 - [Persistence Artifact Inventory](./internals/persistence-artifact-inventory.md)
