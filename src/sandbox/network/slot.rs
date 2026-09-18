@@ -376,10 +376,11 @@ impl Slot {
     /// `create_network` sets up if and only if `firecracker.preopen_tap` is
     /// enabled. This is the single decision point shared by the spawn-side
     /// fd handoff and the `fdp:` `host_dev_name` spec — never decide
-    /// the two separately.
-    pub(crate) fn tap_handoff(&self) -> Option<TapHandoff> {
-        let queue_fd = self.tap_queue_fd.as_ref()?.as_raw_fd();
-        Some(TapHandoff { queue_fd })
+    /// the two separately. The returned handoff borrows the queue, so the
+    /// descriptor is guaranteed to stay open for the spawn call consuming
+    /// it.
+    pub(crate) fn tap_handoff(&self) -> Option<TapHandoff<'_>> {
+        self.tap_queue_fd.as_ref().map(TapHandoff::new)
     }
 
     /// Discards frames queued while the slot was live or pooled so the next

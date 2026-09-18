@@ -3,6 +3,8 @@
 > 面向评审与后续维护的实现文档，与代码同构。
 >
 > - AgentENV：`/root/github/AgentENV`，分支 `faet-tap-v2`，提交 `e36dd5e`
+>   （后续强化：`f229719` pidfd 收割；本提交 handoff 借用化 + `activate`
+>   收敛）
 > - Firecracker：`/root/github/firecracker`，分支 `feat-tap`，提交 `3266cc03c`
 >
 > 两个提交必须配对发布：AgentENV 产出 `fdp:` spec，Firecracker 消费之。
@@ -66,8 +68,9 @@ and never pay a TUNSETIFF on the hot path"）、`tap_device.go:211`
   之后）。
 - **fd 交接是 posix_spawn file action**（`ScopedSpawnSpec::fd_handoff`，
   `src/privileges.rs`）：`adddup2` 在 spawned 子进程内执行，天然子进程
-  私有，父进程 fd 表零污染，跨线程并发 spawn 无竞争窗口。spec 只捕获裸
-  fd 数值，调用方持 Slot 活过整个 spawn 即可（现状调用点天然满足）。
+  私有，父进程 fd 表零污染，跨线程并发 spawn 无竞争窗口。交接只携带裸
+  fd 数值，但 `TapHandoff<'a>` 借用队列描述符本身，"描述符活过整个
+  spawn"由借用检查器静态保证（I4）。
 - **FC spawn 走 glibc `posix_spawn`**（`clone(CLONE_VM|CLONE_VFORK)` +
   execve）：server 进程不再 fork，零页表复制——带 `pre_exec` hook 的
   spawn 会失去该资格退化为真 fork（fat-fork，O(server RSS)），这就是本
@@ -119,10 +122,12 @@ slot 销毁：cleanup(veth/netns 文件) → 字段 drop 关 fd → netns 引用
   `Slot::tap_handoff()`（spawn 侧与 `sandbox_host_dev_name()` 都是它的
   消费端），不允许各写各的判断。
 - **I3**：所有释放路径（stop / Drop / warm 池清理）都经
-  `NetworkManager::release`；所有取用路径（slot 池 acquire、warm-FC
-  acquire）都 drain。
-- **I4**：slot fd 一律 `O_CLOEXEC`；spawn 交接只携带裸 fd 数值
-  （`TapHandoff`），调用方保证 Slot 活过 spawn。
+  `NetworkManager::release`（入池前 drain）；所有取用路径统一收敛到
+  `NetworkManager` 的单一入口——slot 池取用走 `allocate_any`，warm-FC
+  adopt 走 `activate`——两者都 drain，新增取用路径不必各自记得排水。
+- **I4**：slot fd 一律 `O_CLOEXEC`；`TapHandoff<'a>` 借用队列描述符，
+  spawn 只消费其中的裸 fd 数值——"队列活过整个 spawn"由借用检查器
+  保证，不再依赖调用方纪律。
 
 ## 4. AgentENV 实现（`e36dd5e`）
 
@@ -149,7 +154,9 @@ slot 销毁：cleanup(veth/netns 文件) → 字段 drop 关 fd → netns 引用
 
 ### 4.2 `src/sandbox/firecracker/instance.rs`
 
-1. `TapHandoff { queue_fd: RawFd }`；`host_dev_name()` 固定产出
+1. `TapHandoff<'a> { queue_fd: RawFd, _queue: &'a OwnedFd }`（字段私有，
+   经 `TapHandoff::new(&queue)` 构造）：借用把"队列描述符活过 spawn"
+   钉进类型（I4）；`host_dev_name()` 固定产出
    `"fdp:3:tap0"`（`NET_TAP_FD = 3`，标准流后第一个槽位；子进程只消费
    被告知的描述符，覆盖继承位安全）。
 2. spawn 组装 `ScopedSpawnSpec::fd_handoff = (queue_fd, NET_TAP_FD)`：
@@ -162,9 +169,11 @@ slot 销毁：cleanup(veth/netns 文件) → 字段 drop 关 fd → netns 引用
 
 ### 4.3 `src/sandbox/network/manager.rs`
 
-- `release()`：入池前 `slot.drain_tap_queue()`（I3）。
-- `allocate_any()` 快路径：`try_acquire` 成功后 drain（覆盖 slot 池 idle
-  窗口，也是 warm-FC 条目创建时的统一入口）。
+- `release()`：入池前 `slot.drain_tap_queue()`（丢弃离场租户的帧）。
+- `activate(&mut Slot)`（I3 取用侧单一入口）：drain + `debug_assert`
+  位图仍持有该 slot。`allocate_any()` 快路径与 warm-FC adopt 都走它：
+  warm 条目在 FC 池 idle 时 FC 进程持有 fd 3 但从不读，帧积在共享
+  socket 里，而 adopt 不经过 `release`，故必须显式过 activate。
 - `cleanup_slot_and_release_bit*`（销毁路径）不 drain——netns 将销毁。
 
 ### 4.4 `src/sandbox/firecracker/sandbox.rs`、`pool.rs`、`mod.rs`
@@ -174,9 +183,8 @@ slot 销毁：cleanup(veth/netns 文件) → 字段 drop 关 fd → netns 引用
 2. `sandbox_host_dev_name()`（sandbox.rs:1431，I2 消费端）：
    `tap_handoff()` 有则取 `host_dev_name()`，否则回退
    `SANDBOX_TAP_IFACE_NAME`（按名打开）。
-3. `start_resume` 的 warm-FC 获取分支（sandbox.rs:1889）单独 drain：warm
-   条目在 FC 池里 idle 时 FC 进程持有 fd 3 但从不读，帧积在共享 socket
-   里；该路径不经过 `NetworkManager::release`。
+3. `start_resume` 的 warm-FC 获取分支走 `NetworkManager::activate()`
+   （见 §4.3 的 drain 语义），不再手工 drain。
 4. `mod.rs` re-export `TapHandoff`。
 
 ### 4.5 配置与文档
@@ -200,8 +208,11 @@ posix_spawn 资格，退化为裸 `fork()`，其成本是 O(server 页表)。现
   `addchdir_np`、`SETPGROUP(0)`、`SETSIGDEF(SIGPIPE)`），env 继承
   `environ`；`addchdir_np` 要求 glibc ≥ 2.29。
 - `ScopedChild` 取代 FC 场景的 `tokio::process::Child`：`id/try_wait/
-  wait/start_kill` + Drop=SIGKILL+有界回收（对齐原 `kill_on_drop`）；
-  async `wait` 用"先注册 SIGCHLD 流、再轮询 waitpid(WNOHANG)"协议。
+  wait/start_kill` + Drop=SIGKILL+有界回收（对齐原 `kill_on_drop`）。
+  spawn 后立刻 `pidfd_open`（Linux ≥ 5.3；ublk 路线本就要求更高内核），
+  async `wait` 等 pidfd 的 epoll 可读（`AsyncFd`），彻底去掉 SIGCHLD 流；
+  `start_kill` 走 `pidfd_send_signal`（fd 钉住 task，无 pid 复用窗口），
+  Drop 用一次有界 `poll` + 单次收割替代 100×1ms 轮询。
 - 语义保持：错误同步上报（glibc 对 execve/file-action 失败在返回值
   报错）、错误消息含 `ExitStatus` 展示、oom_score_adj/socket 清理/
   SIGTERM→SIGKILL stop 时序全部不变。`fdp:` 契约与 Firecracker 侧
@@ -260,24 +271,25 @@ Firecracker  3266cc03c feat(net): accept pre-configured TAP queues via
   并回收），`sandbox::firecracker` 77 项全过（含 /bin/true 冷启动、
   /bin/echo 早退诊断、warm/cold 日志捕获迁移），`cargo fmt --check`、
   `cargo clippy -p agentenv --all-targets --all-features -- -D warnings`
-  全过。
+  全过；
+- 强化验证（pidfd / handoff 借用化 / `activate` 收敛；验证机：内核 6.6、
+  全量 capability、`/dev/net/tun`，无 `/dev/kvm`）：`privileges` 全部单测
+  及两个 ignored 特权测试（netns 进入、capability 委派）通过；
+  `spawn_with_netns_hands_preopened_tap_descriptor_to_child`（借用化后的
+  端到端 fd 3 交接）与 `test_network_lifecycle`（含 1b 步
+  `TUNGETVNETHDRSZ` 回读 == 12）通过；`sandbox::network` 67 项、
+  `sandbox::firecracker::instance` 9 项通过。
 
-待补（ignored / 需特权环境；本验证机无 CAP_NET_ADMIN/CAP_SYS_ADMIN 与
-/dev/kvm）：
+待补（需 `/dev/kvm` 的行为级验证）：
 
-1. ignored 集成测试：
-   `spawn_with_netns_hands_preopened_tap_descriptor_to_child`（断言子进程
-   fd 3 → `/dev/net/tun`）；`test_network_lifecycle` 第 1b 步
-   （`TUNGETVNETHDRSZ` 回读 == 12）；`privileges` 的 netns 进入与
-   capability 委派两个 ignored 测试；
-2. 冷启动沙箱：`ls -l /proc/<fc_pid>/fd/3` 为 `/dev/net/tun`；**slot 存续
+1. 冷启动沙箱：`ls -l /proc/<fc_pid>/fd/3` 为 `/dev/net/tun`；**slot 存续
    期间 server 进程也持有一个 `/dev/net/tun` fd**；guest 网络连通（MMDS
    可拉取）；
-3. pause → resume：恢复后连通；pause 落盘期间 host 上向
+2. pause → resume：恢复后连通；pause 落盘期间 host 上向
    `host_interaction_ip` 打少量杂散包（如 curl 超时），resume 后 guest
    **不应**收到上一个生命周期的帧（drain 生效的行为级验证）；
-4. warm FC 池路径：制造池 idle 窗口后 resume，重复 3；
-5. `preopen_tap=false` 回归：按名打开，行为与上游一致。
+3. warm FC 池路径：制造池 idle 窗口后 resume，重复 2；
+4. `preopen_tap=false` 回归：按名打开，行为与上游一致。
 
 ### 7.2 量化（bpftrace，脚本见附录）
 

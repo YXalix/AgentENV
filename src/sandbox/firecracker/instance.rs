@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -45,15 +45,27 @@ const NET_TAP_FD: RawFd = 3;
 /// Hands Firecracker the sandbox TAP queue as a pre-opened, pre-configured
 /// descriptor (an `fdp:` `host_dev_name` spec) instead of letting it open the
 /// interface by name inside the sandbox network namespace.
+///
+/// The handoff borrows the queue descriptor it hands over: the spawn dups
+/// the raw number through a child-private file action, so the descriptor
+/// must stay open until the spawn call returns. The borrow makes dropping
+/// the owning queue — and with it the slot — before the spawn a compile
+/// error instead of a runtime hazard.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct TapHandoff {
-    /// Raw descriptor of the slot-owned queue. The spawn only dups this
-    /// number (a child-private posix_spawn file action), so the owning slot
-    /// must outlive the spawn call.
-    pub queue_fd: RawFd,
+pub(crate) struct TapHandoff<'a> {
+    queue_fd: RawFd,
+    _queue: &'a OwnedFd,
 }
 
-impl TapHandoff {
+impl<'a> TapHandoff<'a> {
+    /// Wraps a queue descriptor the caller keeps open across the spawn.
+    pub(crate) fn new(queue: &'a OwnedFd) -> Self {
+        Self {
+            queue_fd: queue.as_raw_fd(),
+            _queue: queue,
+        }
+    }
+
     /// The `host_dev_name` value that hands Firecracker the pre-opened queue.
     /// The `fdp:` spec tells Firecracker the queue's vnet header size is
     /// already preset (`FC_VNET_HDR_LEN` in the slot attach), so it skips its
@@ -99,7 +111,7 @@ impl FirecrackerInstance {
         stdout_path: Option<&Path>,
         stderr_path: Option<&Path>,
         netns: Option<&Path>,
-        tap: Option<TapHandoff>,
+        tap: Option<TapHandoff<'_>>,
     ) -> Result<()> {
         if self.process.is_some() {
             bail!("firecracker process already started");
@@ -808,11 +820,13 @@ mod tests {
     }
 
     #[test]
-    fn tap_handoff_host_dev_name_pins_descriptor_three() {
-        let tap = TapHandoff { queue_fd: 7 };
+    fn tap_handoff_host_dev_name_pins_descriptor_three() -> Result<()> {
+        let queue = OwnedFd::from(fs::File::open("/dev/null")?);
+        let tap = TapHandoff::new(&queue);
         // A Firecracker without fdp: support treats the whole string as an
         // interface name and fails loudly instead of silently mis-parsing.
         assert_eq!(tap.host_dev_name(), "fdp:3:tap0");
+        Ok(())
     }
 
     #[tokio::test]
@@ -821,8 +835,6 @@ mod tests {
         use anyhow::ensure;
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command as StdCommand;
-
-        use std::os::fd::AsRawFd;
 
         use crate::sandbox::network::Slot;
 
@@ -851,9 +863,7 @@ mod tests {
                     Some(&stdout_path),
                     None,
                     None,
-                    Some(TapHandoff {
-                        queue_fd: queue.as_raw_fd(),
-                    }),
+                    Some(TapHandoff::new(&queue)),
                 )
                 .await?;
             // stop() SIGTERMs the child; wait for the probe to run to

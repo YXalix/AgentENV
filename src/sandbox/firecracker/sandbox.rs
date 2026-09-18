@@ -1745,9 +1745,10 @@ impl FirecrackerSandbox {
 
                 let mut slot = warm.slot;
                 // The warm Firecracker held fd 3 but never read while pooled,
-                // and this path bypasses `NetworkManager::release`, so drain
-                // the shared queue here for the restored guest.
-                slot.drain_tap_queue();
+                // and this path bypasses `NetworkManager::release`; entering
+                // active use through the manager drains the shared queue for
+                // the restored guest.
+                NetworkManager::global().activate(&mut slot);
                 self.network_slot = Some(slot);
                 self.work_dir = warm.work_dir; // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
                 let _cold = std::mem::replace(&mut self.fc_instance, warm.fc_instance);
