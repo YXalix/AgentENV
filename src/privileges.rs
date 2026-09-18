@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::ptr;
@@ -10,7 +10,9 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::signal::unix::{signal, SignalKind};
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
+use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
+use tokio::io::unix::AsyncFd;
 use tracing::warn;
 
 pub use linux_cap::{CAP_NET_ADMIN, CAP_SYS_ADMIN};
@@ -160,16 +162,35 @@ pub async fn spawn_scoped(spec: ScopedSpawnSpec) -> io::Result<ScopedChild> {
 
 /// A child process spawned by [`spawn_scoped`].
 ///
-/// The handle owns the pid and is the child's only reaper. Dropping it
-/// SIGKILLs the child and reaps it with a bounded wait.
+/// The handle owns a pidfd for the child and is the child's only reaper.
+/// Waiting rides on the pidfd's epoll readiness instead of SIGCHLD, so no
+/// global signal state is involved and signals cannot coalesce or be
+/// swallowed by another consumer. Dropping it SIGKILLs the child through
+/// the pidfd (which pins the task, so a recycled pid can never be signaled)
+/// and reaps it with a bounded wait.
+///
+/// `pidfd_open` requires Linux 5.3+, which the ublk-based storage path
+/// already exceeds.
 pub struct ScopedChild {
     pid: u32,
+    pidfd: OwnedFd,
     status: Option<ExitStatus>,
 }
 
 impl ScopedChild {
-    fn new(pid: u32) -> Self {
-        Self { pid, status: None }
+    /// The child stays a zombie until this handle reaps it (nothing sets
+    /// SIGCHLD to `SIG_IGN`, which would auto-reap), so the pid cannot be
+    /// recycled between the spawn and this call; a pidfd for an
+    /// already-exited child is simply readable right away.
+    fn new(pid: u32) -> io::Result<Self> {
+        let raw_pid = Pid::from_raw(pid as i32)
+            .ok_or_else(|| io::Error::other("spawned pid does not fit pid_t"))?;
+        let pidfd = pidfd_open(raw_pid, PidfdFlags::empty())?;
+        Ok(Self {
+            pid,
+            pidfd,
+            status: None,
+        })
     }
 
     /// The child's pid. Stays readable after exit (until reaped), so callers
@@ -192,37 +213,35 @@ impl ScopedChild {
     }
 
     /// Waits for the child to exit and returns its exit status, reaping it.
+    ///
+    /// The pidfd becomes readable when the child exits; waiting on it
+    /// through the reactor replaces the SIGCHLD stream. A spurious wakeup
+    /// just re-polls, never errors.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         if let Some(status) = self.status {
             return Ok(status);
         }
-        // Register for SIGCHLD before the first poll: this handle is the
-        // child's only reaper, so an exit landing after the poll raises a
-        // fresh SIGCHLD that wakes the stream below. Coalescing with other
-        // children's signals is harmless because every wakeup re-polls.
-        let mut sigchld = signal(SignalKind::child())?;
+        let pidfd = AsyncFd::new(self.pidfd.try_clone()?)?;
         loop {
             if let Some(status) = self.try_wait()? {
                 return Ok(status);
             }
-            sigchld.recv().await;
+            let mut guard = pidfd.readable().await?;
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            guard.clear_ready();
         }
     }
 
-    /// SIGKILLs the child. A no-op once the child has been reaped, because its
-    /// pid may already belong to another process.
+    /// SIGKILLs the child. A no-op once the child has been reaped.
     pub fn start_kill(&mut self) -> io::Result<()> {
         if self.status.is_some() {
             return Ok(());
         }
-        // SAFETY: plain signal send to this handle's own child; the pid is not
-        // reusable until reaped, which only this handle does.
-        let rc = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        // Signal through the pidfd: it pins the task, so there is no
+        // pid-reuse window to reason about, unlike signaling by pid.
+        pidfd_send_signal(self.pidfd.as_fd(), Signal::KILL).map_err(io::Error::from)
     }
 }
 
@@ -238,26 +257,26 @@ impl Drop for ScopedChild {
                 "failed to kill scoped child process on drop"
             );
         }
-        // Backstop reap so the killed child does not linger as a zombie. A
-        // SIGKILLed child normally exits within milliseconds; the bounded
-        // loop also works on threads without a Tokio runtime (the pool's
-        // process-exit hook), and a leftover zombie there is reparented to
-        // init when the server exits.
-        for _ in 0..100 {
-            match try_reap_status(self.pid) {
-                Ok(Some(_)) => return,
-                Ok(None) => thread::sleep(Duration::from_millis(1)),
-                Err(err) => {
-                    warn!(
-                        pid = self.pid,
-                        error = %err,
-                        "failed to reap scoped child process"
-                    );
-                    return;
-                }
+        // Bounded reap so the killed child does not linger as a zombie.
+        // SIGKILL is unignorable, so the child normally exits within
+        // milliseconds; a single bounded wait also works on threads without
+        // a Tokio runtime (the pools' process-exit hooks), and a leftover
+        // zombie there is reparented to init when the server exits.
+        let mut pollfds = [PollFd::new(&self.pidfd, PollFlags::IN)];
+        let timeout =
+            Timespec::try_from(Duration::from_millis(100)).expect("100ms always fits a timespec");
+        let _ = poll(&mut pollfds, Some(&timeout));
+        match try_reap_status(self.pid) {
+            Ok(Some(_)) => {}
+            Ok(None) => warn!(pid = self.pid, "timed out reaping scoped child process"),
+            Err(err) => {
+                warn!(
+                    pid = self.pid,
+                    error = %err,
+                    "failed to reap scoped child process"
+                );
             }
         }
-        warn!(pid = self.pid, "timed out reaping scoped child process");
     }
 }
 
@@ -326,7 +345,7 @@ fn posix_spawn_exec(spec: &ScopedSpawnSpec) -> io::Result<ScopedChild> {
             ptr::addr_of!(environ),
         )
     })?;
-    Ok(ScopedChild::new(pid as u32))
+    ScopedChild::new(pid as u32)
 }
 
 /// Maps a spawn function's return value: glibc's spawn family returns an error
