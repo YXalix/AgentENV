@@ -48,6 +48,7 @@ Firecracker VM binary and boot configuration.
 | `work_dir` | string | `"$AENV_HOME/firecracker-work"` | Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as `overlaybd/upper.data` and `overlaybd/upper.index` |
 | `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging |
 | `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). A non-empty value enables `firecracker.log` and stdout/stderr capture in each sandbox's log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream |
+| `preopen_tap` | boolean | `true` | Pre-open the sandbox TAP queue when the network slot is created and hold the descriptor for the slot's lifetime. The queue is attached with its vnet header size preset, and spawns hand it to Firecracker as an `fdp:<fd>:<name>` `host_dev_name` spec (a plain `dup` in the child), so pausing or exiting Firecracker never detaches the queue and Firecracker skips its validation and vnet-header configuration ioctls. Requires a Firecracker build with `fdp:` spec support; set to `false` when running an unpatched binary |
 
 ## `[kernel]`
 
