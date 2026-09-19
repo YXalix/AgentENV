@@ -28,7 +28,10 @@ use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, Open
 use super::policy::{
     initialize_namespace_egress_chain, set_namespace_egress_policy, SandboxNetworkPolicy,
 };
-use super::{NetworkAddressPlan, NetworkError, HOST_VETH_PREFIX, MAX_SLOTS, NETNS_PREFIX};
+use super::{
+    mac_string, NetworkAddressPlan, NetworkError, HOST_VETH_PREFIX, MAX_SLOTS, NETNS_PREFIX,
+    TAP_MAC,
+};
 use crate::sandbox::firecracker::{TapHandoff, SANDBOX_TAP_IFACE_NAME};
 
 /// Process-wide baseline network namespace fd.
@@ -570,6 +573,25 @@ impl Slot {
         )?;
         if !status.success() {
             return Err(anyhow!("ip tuntap add failed"));
+        }
+
+        // Pin tap0's link address to the plan constant while the device is
+        // still down: a restored guest's neighbour table is frozen with the
+        // `tap_ip -> tap0 MAC` mapping of whichever slot captured its
+        // snapshot, so every slot must present the same tap0 MAC or replies
+        // from a guest restored onto a foreign slot would be dropped here.
+        let tap_mac = mac_string(&TAP_MAC);
+        let status = crate::privileges::run_with_scoped_capabilities(
+            &[crate::privileges::CAP_NET_ADMIN],
+            || {
+                Command::new("ip")
+                    .args(["link", "set", "dev", "tap0", "address", &tap_mac])
+                    .status()
+                    .context("Failed to execute ip link set tap0 address")
+            },
+        )?;
+        if !status.success() {
+            return Err(anyhow!("ip link set tap0 address failed"));
         }
 
         // Enable tap0 and add strict IP via Netlink
@@ -1157,6 +1179,7 @@ fn parse_nameserver_ipv4(contents: &str) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::network::GUEST_MAC;
 
     /// `_IOR('T', 215, int)`: read back a queue's vnet header size.
     const TUNGETVNETHDRSZ: libc::c_ulong = 0x8004_54d7;
@@ -1183,6 +1206,21 @@ mod tests {
         command_stdout("ip", &["-o", "link", "show", &veth_name])
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
+    }
+
+    /// Runs `ip <args>` inside the slot's namespace via nsenter. Tests only:
+    /// production code enters namespaces with dedicated threads.
+    fn nsenter_ip(netns_path: &std::path::Path, args: &[&str]) -> Option<String> {
+        let output = Command::new("nsenter")
+            .arg(format!("--net={}", netns_path.display()))
+            .arg("ip")
+            .args(args)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     fn unused_test_slot() -> Slot {
@@ -1345,6 +1383,19 @@ mod tests {
     }
 
     #[test]
+    fn planned_macs_are_locally_administered_unicast_and_distinct() {
+        for mac in [GUEST_MAC, TAP_MAC] {
+            assert_eq!(
+                mac[0] & 0b0000_0011,
+                0b0000_0010,
+                "plan MACs must be locally administered unicast addresses"
+            );
+        }
+        assert_ne!(GUEST_MAC, TAP_MAC, "guest and tap0 must not share a MAC");
+        assert_eq!(mac_string(&GUEST_MAC), "02:61:65:6e:76:21");
+    }
+
+    #[test]
     fn tap_handoff_requires_attached_queue() {
         let slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
         // No queue was attached (create_network never ran), so even with
@@ -1403,6 +1454,18 @@ mod tests {
         } else {
             assert!(slot.tap_queue_fd.is_none());
         }
+
+        // 1c. tap0 presents the pinned plan MAC, so a guest restored onto
+        // this slot whose snapshot froze `tap_ip -> tap0 MAC` on another
+        // slot still addresses us correctly.
+        let netns_path = slot.namespace_path();
+        let tap_link = nsenter_ip(&netns_path, &["-o", "link", "show", "dev", "tap0"])
+            .expect("nsenter ip link show tap0");
+        let planned_tap_mac = mac_string(&TAP_MAC);
+        assert!(
+            tap_link.contains(&planned_tap_mac),
+            "tap0 must present the pinned plan MAC {planned_tap_mac}: {tap_link}"
+        );
 
         // 2. Verify Namespace File
         let netns_path = slot.namespace_path();
