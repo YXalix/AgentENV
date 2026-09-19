@@ -40,7 +40,7 @@ use crate::sandbox::extra_drive::{
     prepare_extra_drives, DriveMount, ExtraDrive, ExtraDrivePrepareMode, ROOTFS_DRIVE_ID,
     USER_ROOTFS_DRIVE_ID, VOLUME_DRIVE_SLOT_PREFIX,
 };
-use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
+use crate::sandbox::network::{mac_string, NetworkManager, SandboxNetworkPolicy, Slot, GUEST_MAC};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
     OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, SharedReadOnlyDevice,
@@ -2302,11 +2302,14 @@ impl FirecrackerSandbox {
         self.configure_extra_drives(&volume_slots).await?;
 
         if self.network_slot.is_some() {
-            // Network interface.
+            // Network interface. Every fresh VM boots with the plan's single
+            // guest MAC so template snapshots capture it and restores reuse
+            // it; a random per-VM MAC would leave stale neighbour entries in
+            // pooled slots.
             self.fc_instance
                 .add_network_interface(
                     SANDBOX_NET_IFACE_ID,
-                    None,
+                    Some(mac_string(&GUEST_MAC)),
                     self.sandbox_host_dev_name(),
                     None,
                     None,
