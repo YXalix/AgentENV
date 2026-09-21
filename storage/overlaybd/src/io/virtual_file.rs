@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "io-uring")]
 use storage_util::io_ring::AsyncIoRing;
-use storage_util::{CompactBuffer, CompactWriter};
+use storage_util::{CompactBuffer, CompactWriter, PooledBuffer};
 
 /// Boxed non-`Send` future used by the `_with_ctx` variants on
 /// [`VirtualFile`]. The `IoCtx` borrows a `!Send` [`AsyncIoRing`] (it holds
@@ -194,39 +194,29 @@ pub trait VirtualFile: Send + Sync {
 
 /// [`CompactWriter`] backed by a [`VirtualFile`].
 ///
-/// Allocates plain `Vec<u8>` buffers and delegates writes to
-/// [`VirtualFile::write_at`]. This preserves the existing behaviour for
-/// local files, io_uring-backed files, and any other `VirtualFile`
-/// implementation.
+/// Buffers are [`PooledBuffer`]s leased from the global pool and writes
+/// delegate to [`VirtualFile::write_at`].
 pub struct VirtualFileWriter {
     file: Arc<dyn VirtualFile>,
-    buf_size: usize,
 }
 
 impl VirtualFileWriter {
-    /// Create a writer that uses 32 KB buffers (the historical default).
-    pub fn new(file: Arc<dyn VirtualFile>) -> Self {
-        Self {
-            file,
-            // default buffer size is 32 KB
-            buf_size: 32 * 1024,
-        }
-    }
+    /// Fixed size of the buffers handed out by `alloc_buffer`.
+    const BUFFER_SIZE: usize = 32 * 1024;
 
-    /// Create a writer with a custom buffer size.
-    pub fn with_buffer_size(file: Arc<dyn VirtualFile>, buf_size: usize) -> Self {
-        Self { file, buf_size }
+    pub fn new(file: Arc<dyn VirtualFile>) -> Self {
+        Self { file }
     }
 }
 
 #[async_trait]
 impl CompactWriter for VirtualFileWriter {
     async fn alloc_buffer(&self) -> Result<Box<dyn CompactBuffer>> {
-        Ok(Box::new(vec![0u8; self.buf_size]))
+        Ok(Box::new(PooledBuffer::new(Self::BUFFER_SIZE)))
     }
 
     fn buffer_size(&self) -> usize {
-        self.buf_size
+        Self::BUFFER_SIZE
     }
 
     async fn write(&self, buf: Box<dyn CompactBuffer>, offset: u64, len: usize) -> Result<()> {

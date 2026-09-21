@@ -25,6 +25,12 @@ pub const MAX_READ_SIZE: usize = 65_536;
 /// batch so 64 KiB incompressible blocks stay readable.
 const MAX_COALESCED_READ_SIZE: usize = 64 * 1024;
 
+/// Checkout size of the pooled merged-batch buffer: twice the coalescing
+/// budget covers the largest honest encoded block (compressBound(64 KiB)
+/// plus CRC trailer, ≈66 KiB), so one pool size class serves every
+/// well-formed batch.
+const ZFILE_BATCH_BUFFER_SIZE: usize = 2 * MAX_COALESCED_READ_SIZE;
+
 /// One logical pread in this many per thread is sampled for the duration
 /// histograms. The counter is thread-local, so an unsampled pread pays only
 /// a `Cell` increment for observability: no shared atomic, no
@@ -59,57 +65,6 @@ struct ZFilePreadObservation {
     /// included). Stays `Duration::ZERO` for unsampled preads, whose block
     /// loop never calls `Instant::now()`.
     decompress_elapsed: Duration,
-}
-
-std::thread_local! {
-    /// Per-thread free list of merged-batch buffers. Buffers move out by
-    /// value, so no pool borrow is ever held across an `.await`.
-    static COMPRESSED_BUFFER_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Merged-batch buffer checked out of [`COMPRESSED_BUFFER_POOL`]; returns
-/// to the pool on drop (error exits included), so steady-state preads on
-/// one thread neither allocate nor re-zero.
-struct PooledBatchBuffer(Vec<u8>);
-
-impl PooledBatchBuffer {
-    fn take() -> Self {
-        Self(
-            COMPRESSED_BUFFER_POOL
-                .with(|pool| pool.borrow_mut().pop())
-                .unwrap_or_default(),
-        )
-    }
-}
-
-impl std::ops::Deref for PooledBatchBuffer {
-    type Target = Vec<u8>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for PooledBatchBuffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl Drop for PooledBatchBuffer {
-    fn drop(&mut self) {
-        let buf = std::mem::take(&mut self.0);
-        // Retain only a few reasonably-sized buffers per thread.
-        if buf.capacity() == 0 || buf.capacity() > 2 * MAX_COALESCED_READ_SIZE {
-            return;
-        }
-        COMPRESSED_BUFFER_POOL.with(|pool| {
-            let mut pool = pool.borrow_mut();
-            if pool.len() < 4 {
-                pool.push(buf);
-            }
-        });
-    }
 }
 
 const HEADER_TRAILER_SPACE: usize = 512;
@@ -1016,9 +971,11 @@ impl ZFileRO {
         stats.blocks = (end_idx - begin_idx) as u64;
 
         let mut written = 0usize;
-        // Merged encoded-block buffer covering one coalesced batch; pooled
-        // per thread, so steady-state preads neither allocate nor re-zero.
-        let mut compressed = PooledBatchBuffer::take();
+        // Merged encoded-block buffer leased from the global pool once per
+        // pread and reused across batches, so steady-state preads neither
+        // allocate nor re-zero. Sized to fit a single oversized encoded
+        // block as well (see ZFILE_BATCH_BUFFER_SIZE).
+        let mut compressed = storage_util::PooledBuffer::new(ZFILE_BATCH_BUFFER_SIZE);
         // Single-block buffer backing CRC/decompress retries, allocated
         // lazily on the first failed block so clean reads never pay for it.
         let mut retry_block: Option<Vec<u8>> = None;
@@ -1039,17 +996,24 @@ impl ZFileRO {
                 "batch_len",
             )?;
 
-            compressed.clear();
-            compressed.reserve(batch_len);
-            // SAFETY: `read_exact` fills the whole `batch_len` span before
-            // the buffer is read below; a short read errors out and the
-            // contents are never observed.
-            unsafe { compressed.set_len(batch_len) };
+            // Well-formed batches always fit the pooled buffer: multi-block
+            // batches are bounded by the coalescing budget and a single
+            // oversized encoded block stays below ZFILE_BATCH_BUFFER_SIZE.
+            // A larger span means a malformed jump table; fall back to a
+            // one-off allocation rather than opening a new pool size class.
+            // `read_exact` fills `[0, batch_len)` before any of it is read.
+            let mut oversized;
+            let batch: &mut [u8] = if batch_len <= ZFILE_BATCH_BUFFER_SIZE {
+                &mut compressed.as_mut()[..batch_len]
+            } else {
+                oversized = vec![0u8; batch_len];
+                &mut oversized
+            };
             // One merged-range exact read per batch: counted at submission,
             // so a failed read still accounts its submitted bytes.
             stats.read_batches += 1;
             stats.encoded_bytes += batch_len as u64;
-            read_exact(reader, self.file.as_ref(), batch_begin, &mut compressed).await?;
+            read_exact(reader, self.file.as_ref(), batch_begin, batch).await?;
 
             for idx in batch_begin_idx..batch_end_idx {
                 let block_begin = self.jump_table.offset_at(idx)?;
@@ -1097,7 +1061,7 @@ impl ZFileRO {
                             let block: &[u8] = if from_retry_buffer {
                                 retry_block.as_deref().expect("retry buffer allocated")
                             } else {
-                                &compressed[merged_begin..merged_begin + encoded_len]
+                                &batch[merged_begin..merged_begin + encoded_len]
                             };
                             (
                                 u32::from_le_bytes(
@@ -1142,7 +1106,7 @@ impl ZFileRO {
                         let block: &[u8] = if from_retry_buffer {
                             retry_block.as_deref().expect("retry buffer allocated")
                         } else {
-                            &compressed[merged_begin..merged_begin + encoded_len]
+                            &batch[merged_begin..merged_begin + encoded_len]
                         };
                         if cp_begin == 0 && cp_len == block_size {
                             let dst_slice = &mut buf[written..written + cp_len];
@@ -1824,25 +1788,7 @@ impl ZFileBuilder {
         self.commit_compressed_batch(batch).await
     }
 
-    async fn write_full_blocks_borrowed(&mut self, source: &[u8]) -> Result<()> {
-        let block_size = usize::try_from(self.opt.block_size).context("invalid block_size")?;
-        ensure!(
-            source.len().is_multiple_of(block_size),
-            "source must contain a whole number of blocks"
-        );
-        if source.is_empty() {
-            return Ok(());
-        }
-
-        let block_count = source.len() / block_size;
-        if self.args.workers <= 1 || block_count == 1 {
-            return self.compress_and_commit(source, block_size).await;
-        }
-
-        self.write_full_blocks_owned(source.to_vec()).await
-    }
-
-    async fn write_full_blocks_owned(&mut self, source: Vec<u8>) -> Result<()> {
+    async fn write_full_blocks(&mut self, source: &[u8]) -> Result<()> {
         let block_size = usize::try_from(self.opt.block_size).context("invalid block_size")?;
         ensure!(
             source.len().is_multiple_of(block_size),
@@ -1854,7 +1800,7 @@ impl ZFileBuilder {
 
         let block_count = source.len() / block_size;
         if self.args.workers <= 1 || block_count == 1 || self.pool.is_none() {
-            return self.compress_and_commit(&source, block_size).await;
+            return self.compress_and_commit(source, block_size).await;
         }
 
         // Persistent-pool fan-out: split the batch into per-worker segments,
@@ -1965,7 +1911,7 @@ impl ZFileBuilder {
             // Borrow the completed block so the builder state stays
             // consistent even if the await below is cancelled.
             let completed_block = self.reserved_buf[..block_size].to_vec();
-            self.write_full_blocks_borrowed(&completed_block).await?;
+            self.write_full_blocks(&completed_block).await?;
             self.reserved_size = 0;
             buf = &buf[needed..];
         }
@@ -1976,7 +1922,7 @@ impl ZFileBuilder {
                 .context("batch_bytes overflow")?;
             let batch_bytes = min(full_bytes, batch_size);
             let (head, tail) = buf.split_at(batch_bytes);
-            self.write_full_blocks_borrowed(head).await?;
+            self.write_full_blocks(head).await?;
             buf = tail;
         }
 
@@ -1987,30 +1933,6 @@ impl ZFileBuilder {
 
         self.raw_data_size = next_raw_data_size;
         Ok(expected)
-    }
-
-    async fn write_owned(&mut self, mut buffer: Vec<u8>, len: usize) -> Result<usize> {
-        ensure!(len <= buffer.len(), "write length exceeds buffer");
-        ensure!(!self.finished, "builder already closed");
-
-        let block_size = self.opt.block_size as usize;
-        if self.reserved_size != 0 || !len.is_multiple_of(block_size) {
-            return self.write(&buffer[..len]).await;
-        }
-
-        let next_raw_data_size = self
-            .raw_data_size
-            .checked_add(len as u64)
-            .context("raw_data_size overflow")?;
-        buffer.truncate(len);
-
-        // The compact writer only hands over buffers of at most
-        // ZFILE_COMPACT_WRITER_BUFFER_SIZE and `len` covers a whole number
-        // of blocks, so a single batch always spans the whole buffer.
-        self.write_full_blocks_owned(buffer).await?;
-
-        self.raw_data_size = next_raw_data_size;
-        Ok(len)
     }
 
     pub async fn finish(&mut self) -> Result<()> {
@@ -2130,7 +2052,9 @@ impl ZFileCompactWriter {
 #[async_trait]
 impl storage_util::CompactWriter for ZFileCompactWriter {
     async fn alloc_buffer(&self) -> Result<Box<dyn storage_util::CompactBuffer>> {
-        Ok(Box::new(vec![0u8; ZFILE_COMPACT_WRITER_BUFFER_SIZE]))
+        Ok(Box::new(storage_util::PooledBuffer::new(
+            ZFILE_COMPACT_WRITER_BUFFER_SIZE,
+        )))
     }
 
     fn buffer_size(&self) -> usize {
@@ -2147,35 +2071,11 @@ impl storage_util::CompactWriter for ZFileCompactWriter {
         offset: u64,
         len: usize,
     ) -> Result<()> {
-        let buffer = buf
-            .into_any()
-            .downcast::<Vec<u8>>()
-            .map_err(|_| anyhow::anyhow!("zfile compact writer requires Vec<u8> buffers"))?;
-        let mut state = self.state.lock().await;
-        ensure!(!state.finalized, "zfile compact writer already finalized");
-        ensure!(
-            !state.failed,
-            "zfile compact writer failed after previous write error"
-        );
-        ensure!(
-            offset == state.next_offset,
-            "zfile compact writer received offset {offset}, expected {}",
-            state.next_offset
-        );
-        let next_offset = offset
-            .checked_add(len as u64)
-            .context("zfile compact writer logical offset overflow")?;
-        state.failed = true;
-        let written = match state.builder.write_owned(*buffer, len).await {
-            Ok(written) => written,
-            Err(error) => return Err(error),
-        };
-        if written != len {
-            bail!("zfile builder performed a short write");
+        let data = AsRef::<[u8]>::as_ref(buf.as_ref());
+        if len > data.len() {
+            bail!("zfile compact writer write len exceeds buffer range");
         }
-        state.next_offset = next_offset;
-        state.failed = false;
-        Ok(())
+        self.write_slice_at(&data[..len], offset).await
     }
 
     async fn write_all_at(&self, data: &[u8], offset: u64) -> Result<()> {

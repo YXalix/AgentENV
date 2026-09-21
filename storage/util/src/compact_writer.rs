@@ -5,9 +5,9 @@ use std::any::Any;
 /// A buffer obtained from a [`CompactWriter`].
 ///
 /// Implementations must be fillable as a mutable byte slice. For the
-/// default `VirtualFileWriter` this is a plain `Vec<u8>`. For a
-/// usrbio/copyd-backed writer this would be an `IovBuffer` pointing into
-/// pre-registered shared memory.
+/// default `VirtualFileWriter` this is a [`crate::PooledBuffer`] leased
+/// from the global buffer pool. For a usrbio/copyd-backed writer this
+/// would be an `IovBuffer` pointing into pre-registered shared memory.
 pub trait CompactBuffer: AsMut<[u8]> + AsRef<[u8]> + Any + Send {
     /// Access the concrete buffer type for writers that can consume a specific
     /// owned representation without copying.

@@ -80,6 +80,8 @@
 
 - [System Architecture](./internals/architecture.md)
 - [Sandbox Network Architecture](./internals/networking.md)
+- [TAP fd Slot Ownership](./internals/tap-fd-slot-ownership-design.md)
+- [TAP Preopen Stale-Neighbor Latency](./internals/tap-preopen-stale-neigh-analysis.md)
 - [Sandbox Internals and Testing](./internals/sandbox-testing.md)
 - [Template Builder and Testing](./internals/template-builder-testing.md)
 - [BuildKit Template Builds](./internals/buildkit-template-builds.md)
