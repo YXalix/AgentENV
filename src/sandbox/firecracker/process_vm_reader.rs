@@ -17,10 +17,8 @@ impl ProcessVmReader {
         Self { pid }
     }
 
-    // TODO: `process_vm_readv` is synchronous and currently runs on the Tokio
-    // worker polling `VirtualFile::read_at_into`. Offloading it without an
-    // extra memory copy requires an owned-buffer interface or a dedicated
-    // blocking worker that owns the destination buffer for the request.
+    // `process_vm_readv` is synchronous; callers must keep it off tokio
+    // workers (the pause path wraps the conversion in `spawn_blocking`).
     fn read_exact_remote(&self, remote_addr: u64, dst: &mut [u8]) -> Result<()> {
         if dst.is_empty() {
             return Ok(());

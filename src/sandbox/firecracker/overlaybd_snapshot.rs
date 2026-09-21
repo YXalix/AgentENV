@@ -804,22 +804,28 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
         .await
         .with_context(|| format!("create mem overlaybd dir: {}", output_dir.display()))?;
 
-    let data_path = output_dir.join("overlaybd.commit");
     let (mappings, memory_size) = dirty_ranges_to_segment_mappings(dirty_ranges)?;
     let source_file: Arc<dyn VirtualFile> = Arc::new(ProcessVmReader::new(firecracker_pid));
     let src_layers = vec![source_file];
-    publish_memory_overlaybd_layer(
-        &src_layers,
-        &mappings,
-        memory_size,
-        &data_path,
-        mode,
-        DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
-    )
+    let data_path = output_dir.to_path_buf().join("overlaybd.commit");
+    // The conversion loop issues GB-scale synchronous `process_vm_readv`/pwrite
+    // calls (and inline compression when enabled); keep it off the runtime
+    // workers (the `mount_initial_guest_drives` pattern).
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current()
+            .block_on(publish_memory_overlaybd_layer(
+                &src_layers,
+                &mappings,
+                memory_size,
+                &data_path,
+                mode,
+                DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
+            ))
+            .context("compact dirty memory ranges as overlaybd layer")?;
+        Ok((data_path, memory_size))
+    })
     .await
-    .context("compact dirty memory ranges as overlaybd layer")?;
-
-    Ok((data_path, memory_size))
+    .context("dirty memory to overlaybd conversion task failed")?
 }
 
 #[cfg(test)]
