@@ -78,8 +78,12 @@ pub(crate) async fn create_commit_args(
                 0,
             ));
             compress_args.workers = workers.max(1);
+            // Pool retention sized to chunk concurrency: steady-state chunks
+            // recycle staging buffers instead of allocating fresh ones.
+            let pool_capacity = concurrency.clamp(1, 1024);
             CommitArgs::from_writer(Arc::new(
-                ZFileCompactWriter::new(output, &compress_args).await?,
+                ZFileCompactWriter::with_pool_capacity(output, &compress_args, pool_capacity)
+                    .await?,
             ))
         }
     };
