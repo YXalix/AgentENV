@@ -1,10 +1,11 @@
 use std::env;
 use std::sync::Once;
 
+use tokio_diagnostics::{DiagnosticsGuard, TokioDiagnosticsConfig};
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter, Layer};
+use tracing_subscriber::{fmt, EnvFilter, Layer, Registry};
 
 const DEFAULT_FILTER: &str = "agentenv=info,envd=info,uvm_ublk=info";
 const LOG_FORMAT_ENV: &str = "AENV_LOG_FORMAT";
@@ -78,35 +79,54 @@ impl SpanEvents {
     }
 }
 
-/// Initialize process-wide logging once.
+fn env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER))
+}
+
+/// Initialize process-wide logging once, including the optional
+/// `[tokio_diagnostics]` layers (tokio-console task inspection, tracing
+/// flame-graph output).
 ///
 /// - Log level filter comes from `RUST_LOG`, or defaults to `agentenv=info,envd=info,uvm_ublk=info`.
 /// - Output format comes from `AENV_LOG_FORMAT`: `compact` (default), `pretty`, or `json`.
 /// - Span lifecycle events come from `AENV_LOG_SPAN_EVENTS`: `off` (default), `new`, `enter`,
 ///   `exit`, `close`, `active`, or `full`.
 ///
-/// Repeated calls are no-ops. If another global subscriber has already been installed,
-/// the initialization error is ignored.
-pub fn init() {
+/// Returns the guard owning the diagnostics layers' non-layer resources.
+/// Repeated calls are no-ops and return an empty guard. If another global
+/// subscriber has already been installed, the initialization error is
+/// ignored.
+///
+/// Diagnostics layers must be installed here, at subscriber build time:
+/// hot-plugging per-layer filters via `reload` leaves them without a
+/// registered `FilterId` and panics console-subscriber on `on_new_span`
+/// (<https://github.com/tokio-rs/tracing/issues/1629>).
+pub fn init(diagnostics: &TokioDiagnosticsConfig) -> DiagnosticsGuard {
+    let mut guard = DiagnosticsGuard::default();
     INIT_LOGGING.call_once(|| {
-        let filter =
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+        let filter = env_filter();
 
         let format = LogFormat::from_env();
         let span_events = SpanEvents::from_env().to_fmt_span();
         let base = fmt::layer().with_span_events(span_events);
 
-        let fmt_layer = match format {
-            LogFormat::Compact => base.compact().boxed(),
-            LogFormat::Pretty => base.pretty().boxed(),
-            LogFormat::Json => base.json().boxed(),
-        };
+        // The fmt layer owns the env filter (per-layer) so diagnostics layers
+        // can subscribe to targets the logs must not see (tokio's TRACE task
+        // instrumentation).
+        let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![match format {
+            LogFormat::Compact => base.compact().with_filter(filter.clone()).boxed(),
+            LogFormat::Pretty => base.pretty().with_filter(filter.clone()).boxed(),
+            LogFormat::Json => base.json().with_filter(filter.clone()).boxed(),
+        }];
 
-        let _ = tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
-            .try_init();
+        let (diagnostics_layers, diagnostics_guard) =
+            tokio_diagnostics::layers(diagnostics, &filter);
+        layers.extend(diagnostics_layers);
+        guard = diagnostics_guard;
+
+        let _ = tracing_subscriber::registry().with(layers).try_init();
     });
+    guard
 }
 
 /// Initialize process-wide logging once for tests.

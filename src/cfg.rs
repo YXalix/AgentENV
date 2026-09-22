@@ -122,6 +122,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub observability: ObservabilityConfig,
     #[config(nested)]
+    pub tokio_diagnostics: tokio_diagnostics::TokioDiagnosticsConfig,
+    #[config(nested)]
     pub cluster: ClusterConfig,
     #[config(nested)]
     pub node_identity: NodeIdentityConfig,
@@ -931,6 +933,9 @@ impl AppConfig {
         }
 
         self.p2p.store_dir = resolve_path(&self.home_path, config_dir, &self.p2p.store_dir);
+
+        self.tokio_diagnostics
+            .normalize_paths(&self.home_path, config_dir);
 
         // Dirty-page tracking is a KVM-only default. Disable it before
         // validation so an existing PVM configuration needs no new override.

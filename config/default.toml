@@ -387,3 +387,55 @@ node_id = "node-a"
 cluster_id = "00000000-0000-0000-0000-000000000000"
 # Identifier for this service instance.
 service_instance_id = "service-instance-a"
+
+# ---------------------------------------------------------------------------
+# Opt-in Tokio diagnostics for hunting serialization under load (temporary
+# performance-analysis tooling). All off by default; no rebuild needed —
+# enable here or via env vars and restart the server. When everything is
+# off, the runtime cost is zero.
+# ---------------------------------------------------------------------------
+
+[tokio_diagnostics.console]
+# Live task inspector: which tasks are busy, parked, or never yielding.
+#   1. cargo install tokio-console
+#   2. start the server, then: tokio-console http://<bind_addr>
+# During a pause/resume load test, sort by Busy and look for many tasks
+# parked behind the same resource (one socket, one lock, one dedicated
+# thread) — that is the serialization point.
+# env: AENV_TOKIO_CONSOLE_ENABLED, AENV_TOKIO_CONSOLE_BIND_ADDR
+# Binds all interfaces by default so the CLI can connect from another host;
+# the console has no auth, so restrict bind_addr or use SSH port-forwarding
+# (-L 6669:127.0.0.1:6669) on untrusted networks.
+enabled = false
+bind_addr = "0.0.0.0:6669"
+
+[tokio_diagnostics.runtime_metrics]
+# Periodic Tokio runtime summary, appended one line per interval to
+# output_path — deliberately separate from the main log so it is not
+# flooded away. Follow with: tail -f logs/tokio-metrics.log
+# Reading guide when CPU and memory are low but throughput degrades:
+# - worker_max_mean_poll_us far above mean_poll_us => a blocking call is
+#   stalling one runtime worker (sync I/O, block_on on a runtime thread)
+# - deep global/local queue depths with low busy_ratio => tasks pile up
+#   behind a serialization point (lock, single consumer, dedicated thread)
+# - growing blocking_queue_depth => the spawn_blocking pool is saturated
+# env: AENV_TOKIO_METRICS_ENABLED, AENV_TOKIO_METRICS_INTERVAL_SECS,
+#      AENV_TOKIO_METRICS_OUTPUT
+enabled = false
+interval_secs = 10
+output_path = "$AENV_HOME/logs/tokio-metrics.log"
+
+[tokio_diagnostics.flame]
+# Wall-clock flame graph of tracing spans. Span width = time from span open
+# to close, including idle time inside .await — that is what exposes
+# serialization. The layer shares the RUST_LOG filter (default:
+# agentenv=info,envd=info,uvm_ublk=info); only spans whose target/level
+# pass the filter are recorded, so run e.g.
+#   RUST_LOG="agentenv=debug" ...
+# to capture finer-grained spans (at higher volume). After stopping the
+# server (the file is flushed on exit), render with:
+#   cargo install inferno
+#   inferno-flamegraph < tracing-flame.folded > flame.svg
+# env: AENV_TRACING_FLAME_ENABLED, AENV_TRACING_FLAME_PATH
+enabled = false
+output_path = "$AENV_HOME/logs/tracing-flame.folded"

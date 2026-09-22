@@ -1,2 +1,6 @@
 [alias]
 adev = "run --package adev --"
+
+[build]
+# tokio_unstable is required by the tokio-diagnostics crate (tokio-console, runtime metrics).
+rustflags = ["--cfg", "tokio_unstable"]

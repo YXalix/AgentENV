@@ -16,6 +16,7 @@ members = [
     "crates/object-store-operator",
     "crates/test-support",
     "crates/shell-util",
+    "crates/tokio-diagnostics",
     "crates/warm-pool",
     "src/api/generated",
     "src/custom_extension_api/generated",
@@ -79,6 +80,7 @@ confique = { version = "0.4.0", features = ["toml"] }
 which = "8.0.0"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
+tokio-diagnostics = { path = "crates/tokio-diagnostics" }
 metrics = "0.24"
 agentenv-observability = { path = "crates/observability" }
 time = { version = "0.3", features = ["serde-well-known", "macros"] }

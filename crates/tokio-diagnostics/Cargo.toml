@@ -1,0 +1,14 @@
+[package]
+name = "tokio-diagnostics"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+confique = { version = "0.4.0", features = ["toml"] }
+console-subscriber = "0.4"
+tokio = { version = "1", features = ["fs", "rt-multi-thread", "time"] }
+tokio-metrics = "0.4"
+time = { version = "0.3", features = ["formatting"] }
+tracing = "0.1"
+tracing-flame = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }

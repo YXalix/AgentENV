@@ -11,6 +11,7 @@ use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceMa
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
 use agentenv::volume::{VolumeLimits, VolumeManager};
+use anyhow::Context;
 use axum::serve::ListenerExt;
 use clap::Parser;
 use tokio::sync::oneshot;
@@ -53,11 +54,14 @@ struct ServerCli {
     config: Option<std::path::PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    agentenv::logging::init();
-    agentenv_observability::init_prometheus_recorder()?;
+fn main() -> anyhow::Result<()> {
+    let runtime = tokio_diagnostics::build_runtime().context("failed to build tokio runtime")?;
+    runtime.block_on(run())
+}
 
+async fn run() -> anyhow::Result<()> {
+    // Config loads before logging init: the `[tokio_diagnostics]` layers are
+    // installed while the subscriber is built (see `logging::init`).
     let cli = ServerCli::parse();
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
         agentenv::cfg::ConfigManager::init_global_from_path(config_path)?
@@ -65,6 +69,11 @@ async fn main() -> anyhow::Result<()> {
         agentenv::cfg::ConfigManager::init_global()?
     };
     let config = config_manager.config();
+
+    let diagnostics_guard = agentenv::logging::init(&config.tokio_diagnostics);
+    agentenv_observability::init_prometheus_recorder()?;
+
+    tokio_diagnostics::start(&config.tokio_diagnostics, diagnostics_guard);
 
     if cli.setup_only {
         agentenv::setup::ensure_provisioning(config).await?;
