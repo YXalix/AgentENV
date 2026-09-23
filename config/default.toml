@@ -424,18 +424,3 @@ bind_addr = "0.0.0.0:6669"
 enabled = false
 interval_secs = 10
 output_path = "$AENV_HOME/logs/tokio-metrics.log"
-
-[tokio_diagnostics.flame]
-# Wall-clock flame graph of tracing spans. Span width = time from span open
-# to close, including idle time inside .await — that is what exposes
-# serialization. The layer shares the RUST_LOG filter (default:
-# agentenv=info,envd=info,uvm_ublk=info); only spans whose target/level
-# pass the filter are recorded, so run e.g.
-#   RUST_LOG="agentenv=debug" ...
-# to capture finer-grained spans (at higher volume). After stopping the
-# server (the file is flushed on exit), render with:
-#   cargo install inferno
-#   inferno-flamegraph < tracing-flame.folded > flame.svg
-# env: AENV_TRACING_FLAME_ENABLED, AENV_TRACING_FLAME_PATH
-enabled = false
-output_path = "$AENV_HOME/logs/tracing-flame.folded"

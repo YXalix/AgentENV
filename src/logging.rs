@@ -84,8 +84,7 @@ fn env_filter() -> EnvFilter {
 }
 
 /// Initialize process-wide logging once, including the optional
-/// `[tokio_diagnostics]` layers (tokio-console task inspection, tracing
-/// flame-graph output).
+/// `[tokio_diagnostics]` layers (tokio-console task inspection).
 ///
 /// - Log level filter comes from `RUST_LOG`, or defaults to `agentenv=info,envd=info,uvm_ublk=info`.
 /// - Output format comes from `AENV_LOG_FORMAT`: `compact` (default), `pretty`, or `json`.
@@ -119,8 +118,7 @@ pub fn init(diagnostics: &TokioDiagnosticsConfig) -> DiagnosticsGuard {
             LogFormat::Json => base.json().with_filter(filter.clone()).boxed(),
         }];
 
-        let (diagnostics_layers, diagnostics_guard) =
-            tokio_diagnostics::layers(diagnostics, &filter);
+        let (diagnostics_layers, diagnostics_guard) = tokio_diagnostics::layers(diagnostics);
         layers.extend(diagnostics_layers);
         guard = diagnostics_guard;
 

@@ -1,6 +1,5 @@
 //! Opt-in Tokio diagnostics for the AgentENV server: tokio-console task
-//! inspection, periodic runtime metrics logging, and wall-clock tracing
-//! flame graphs.
+//! inspection and periodic runtime metrics logging.
 //!
 //! Everything is disabled unless turned on via `[tokio_diagnostics]` in the
 //! config. Requires `--cfg tokio_unstable` (set workspace-wide in
@@ -24,7 +23,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::runtime::Handle;
 use tracing::info;
 use tracing_subscriber::filter::Targets;
-use tracing_subscriber::{EnvFilter, Layer, Registry};
+use tracing_subscriber::{Layer, Registry};
 
 #[derive(Debug, Config, Clone)]
 pub struct TokioDiagnosticsConfig {
@@ -34,16 +33,12 @@ pub struct TokioDiagnosticsConfig {
     /// Periodic Tokio runtime metrics logging (poll times, queue depths).
     #[config(nested)]
     pub runtime_metrics: TokioRuntimeMetricsConfig,
-    /// Wall-clock tracing flame graph output.
-    #[config(nested)]
-    pub flame: TracingFlameConfig,
 }
 
 impl TokioDiagnosticsConfig {
     /// Expand the `$AENV_HOME` placeholder in the output paths, then anchor
     /// them at `config_dir` when still relative.
     pub fn normalize_paths(&mut self, home_path: &Path, config_dir: &Path) {
-        self.flame.output_path = expand_path(&self.flame.output_path, home_path, config_dir);
         self.runtime_metrics.output_path =
             expand_path(&self.runtime_metrics.output_path, home_path, config_dir);
     }
@@ -90,33 +85,17 @@ pub struct TokioRuntimeMetricsConfig {
     pub output_path: PathBuf,
 }
 
-#[derive(Debug, Config, Clone)]
-pub struct TracingFlameConfig {
-    /// Write folded-stack flame graph data while the server runs. Wall-clock
-    /// (not CPU) based; use `inferno-flamegraph` to render. Off by default.
-    #[config(default = false, env = "AENV_TRACING_FLAME_ENABLED")]
-    pub enabled: bool,
-    #[config(
-        default = "$AENV_HOME/logs/tracing-flame.folded",
-        env = "AENV_TRACING_FLAME_PATH",
-        parse_env = parse_required_path
-    )]
-    pub output_path: PathBuf,
-}
-
 fn parse_required_path(raw: &str) -> std::result::Result<PathBuf, std::convert::Infallible> {
     Ok(PathBuf::from(raw.trim()))
 }
 
 /// Guards the non-layer pieces of the diagnostics stack.
 ///
-/// Dropping it stops flushing flame-graph data; [`start`] parks it in a
-/// task for the runtime lifetime. The tokio-console server driver is taken
-/// out via [`DiagnosticsGuard::take_console_server`].
+/// The tokio-console server driver is taken out via
+/// [`DiagnosticsGuard::take_console_server`].
 #[derive(Default)]
 pub struct DiagnosticsGuard {
     console_server: Option<console_subscriber::Server>,
-    flame_guard: Option<tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>>,
 }
 
 impl DiagnosticsGuard {
@@ -129,35 +108,17 @@ impl DiagnosticsGuard {
 /// Build the diagnostics tracing layers selected by `config`, plus the guard
 /// owning their non-layer resources.
 ///
-/// `filter` (the same env filter used for fmt logs) is applied to the flame
-/// layer; the console layer gets its own `tokio=trace,runtime=trace` filter
-/// so tokio's TRACE task instrumentation never reaches the log output.
-/// Layers that fail to initialize are skipped with a stderr warning.
+/// The console layer gets its own `tokio=trace,runtime=trace` filter so
+/// tokio's TRACE task instrumentation never reaches the log output. Layers
+/// that fail to initialize are skipped with a stderr warning.
 pub fn layers(
     config: &TokioDiagnosticsConfig,
-    filter: &EnvFilter,
 ) -> (
     Vec<Box<dyn Layer<Registry> + Send + Sync>>,
     DiagnosticsGuard,
 ) {
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = Vec::new();
     let mut guard = DiagnosticsGuard::default();
-
-    if config.flame.enabled {
-        if let Some(parent) = config.flame.output_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        match tracing_flame::FlameLayer::with_file(&config.flame.output_path) {
-            Ok((flame_layer, flush_guard)) => {
-                guard.flame_guard = Some(flush_guard);
-                layers.push(flame_layer.with_filter(filter.clone()).boxed());
-            }
-            Err(err) => eprintln!(
-                "failed to create tracing flame output {}: {err}",
-                config.flame.output_path.display()
-            ),
-        }
-    }
 
     if config.console.enabled {
         match config.console.bind_addr.parse::<SocketAddr>() {
@@ -195,8 +156,7 @@ pub fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 }
 
 /// Activate the selected diagnostics on the current runtime: spawn the
-/// tokio-console server driver and the runtime metrics reporter, and park
-/// `guard` in a task so flame data keeps flushing until shutdown.
+/// tokio-console server driver and the runtime metrics reporter.
 pub fn start(config: &TokioDiagnosticsConfig, mut guard: DiagnosticsGuard) {
     if let Some(server) = guard.take_console_server() {
         info!(
@@ -219,10 +179,6 @@ pub fn start(config: &TokioDiagnosticsConfig, mut guard: DiagnosticsGuard) {
             config.runtime_metrics.output_path.clone(),
         );
     }
-    tokio::spawn(async move {
-        let _guard = guard;
-        std::future::pending::<()>().await;
-    });
 }
 
 /// Append a compact Tokio runtime metrics summary line to `output_path`

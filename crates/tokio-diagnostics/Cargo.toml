@@ -10,5 +10,4 @@ tokio = { version = "1", features = ["fs", "rt-multi-thread", "time"] }
 tokio-metrics = "0.4"
 time = { version = "0.3", features = ["formatting"] }
 tracing = "0.1"
-tracing-flame = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
