@@ -232,12 +232,17 @@ pub struct FirecrackerProcessPoolConfig {
     pub startup_prewarm: bool,
     #[config(default = 4usize)]
     pub fill_concurrency: usize,
+    /// How many warm Firecracker entries to create during server startup.
+    /// `0` skips the startup prewarm.
+    #[config(default = 2usize)]
+    pub prewarm_count: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedFirecrackerPoolConfig {
     pub pool: warm_pool::PoolConfig,
     pub fill_concurrency: usize,
+    pub prewarm_count: usize,
 }
 
 #[derive(Debug, Clone, Config)]
@@ -857,6 +862,7 @@ impl AppConfig {
                 startup_prewarm: pool.startup_prewarm,
             },
             fill_concurrency: pool.fill_concurrency,
+            prewarm_count: pool.prewarm_count,
         })
     }
 
@@ -1173,6 +1179,13 @@ impl AppConfig {
             PoolTomlConfig::validate("firecracker", &firecracker.pool)?;
             if firecracker.fill_concurrency == 0 {
                 bail!("invalid firecracker pool config: fill_concurrency must be > 0");
+            }
+            if firecracker.prewarm_count > firecracker.pool.high_watermark {
+                bail!(
+                    "invalid firecracker pool config: prewarm_count ({}) must be <= high_watermark ({})",
+                    firecracker.prewarm_count,
+                    firecracker.pool.high_watermark
+                );
             }
         }
         Ok(())
@@ -2069,6 +2082,28 @@ mod tests {
         let err = config.validate_pool_config().unwrap_err();
         assert!(
             err.to_string().contains("fill_concurrency"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn firecracker_pool_prewarm_count_rejects_above_high_watermark() {
+        let config = AppConfig {
+            pool: PoolTomlConfig {
+                high_watermark: 4,
+                firecracker: FirecrackerProcessPoolConfig {
+                    enabled: true,
+                    prewarm_count: 8,
+                    ..FirecrackerProcessPoolConfig::default()
+                },
+                ..PoolTomlConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        let err = config.validate_pool_config().unwrap_err();
+        assert!(
+            err.to_string().contains("prewarm_count"),
             "unexpected error: {err}"
         );
     }

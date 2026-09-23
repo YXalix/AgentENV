@@ -299,13 +299,15 @@ Component sections:
 | `[pool.block]` | `startup_prewarm` | boolean | capability-based | Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports `UBLK_F_UPDATE_SIZE`; an explicit value overrides detection |
 | `[pool.firecracker]` | `enabled` | boolean | `true` | Enable pre-spawned Firecracker processes for snapshot resume |
 | `[pool.firecracker]` | `maintenance_enabled` | boolean | `true` | Enable the background Firecracker process maintenance worker |
-| `[pool.firecracker]` | `startup_prewarm` | boolean | `true` | Spawn warm Firecracker entries up to the low watermark during server startup |
+| `[pool.firecracker]` | `startup_prewarm` | boolean | `true` | Spawn warm Firecracker entries during server startup |
 | `[pool.firecracker]` | `fill_concurrency` | integer | `4` | Maximum number of warm Firecracker processes created concurrently by one maintenance refill batch |
+| `[pool.firecracker]` | `prewarm_count` | integer | `2` | How many warm Firecracker entries to create during server startup (`0` skips the prewarm) |
 
 Validation rules:
 
 - `low_watermark <= high_watermark`
 - `[pool.firecracker].fill_concurrency > 0`
+- `[pool.firecracker].prewarm_count <= high_watermark`
 
 ## `[node_identity]`
 

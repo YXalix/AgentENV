@@ -206,6 +206,18 @@ impl<T: Send> WarmPool<T> {
         self.maintenance_cv.notify_one();
     }
 
+    /// Raise the refill target to at least `target` (capped at the high
+    /// watermark) and wake the maintenance worker. Like acquisition pressure,
+    /// this ratchets upward for the process lifetime; it is intended for
+    /// one-shot startup prewarm.
+    pub fn prewarm_to(&self, target: usize) {
+        {
+            let mut fill_target = self.fill_target.lock().unwrap();
+            *fill_target = (*fill_target).max(target.min(self.config.high_watermark));
+        }
+        self.request_maintenance();
+    }
+
     /// Try to acquire a resource from the pool (fast path).
     ///
     /// Returns `Some(resource)` if one is available, `None` if the pool is empty.
@@ -512,6 +524,35 @@ mod tests {
         assert_eq!(
             pool.compute_maintenance_action(4),
             PoolMaintenanceAction::Idle
+        );
+    }
+
+    #[test]
+    fn prewarm_to_raises_fill_target_and_requests_maintenance() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+        });
+
+        pool.prewarm_to(6);
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Fill(6)
+        );
+        assert!(pool.maintenance_signal.lock().unwrap().pending);
+
+        // Capped at the high watermark, and never lowers the target.
+        pool.prewarm_to(64);
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Fill(10)
+        );
+        pool.prewarm_to(1);
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Fill(10)
         );
     }
 

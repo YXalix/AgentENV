@@ -54,6 +54,8 @@ pub struct FirecrackerPool {
     socket_timeout: Duration,
     socket_poll_interval: Duration,
     fill_concurrency: usize,
+    /// How many warm entries `prime` creates during server startup.
+    prewarm_count: usize,
     firecracker_work_base_dir: Option<PathBuf>,
     runtime: Runtime,
 }
@@ -122,6 +124,7 @@ impl FirecrackerPool {
             socket_timeout,
             socket_poll_interval,
             fill_concurrency: pool_config.fill_concurrency,
+            prewarm_count: pool_config.prewarm_count,
             firecracker_work_base_dir,
             runtime,
         }
@@ -175,7 +178,7 @@ impl FirecrackerPool {
         firecracker_pool_cleanup_result(failures)
     }
 
-    /// Eagerly initialize the pool and wait until `low_watermark` warm entries
+    /// Eagerly initialize the pool and wait until `prewarm_count` warm entries
     /// exist, or until `timeout` elapses. This is best-effort; timeout is not an
     /// error because the cold path remains available.
     pub async fn prime(timeout: Duration) -> Result<()> {
@@ -194,17 +197,18 @@ impl FirecrackerPool {
             return Ok(());
         }
 
-        let target = pool.pool.config().low_watermark;
+        let target = pool.prewarm_count;
         if target == 0 || pool.warm_len() >= target {
             return Ok(());
         }
 
         info!(
-            low_watermark = target,
+            prewarm_count = target,
             current = pool.warm_len(),
             timeout_ms = timeout.as_millis(),
             "priming firecracker pool"
         );
+        pool.pool.prewarm_to(target);
 
         let started = Instant::now();
         loop {

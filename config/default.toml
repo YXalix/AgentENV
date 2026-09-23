@@ -317,6 +317,8 @@ enabled = true
 startup_prewarm = true
 # Maximum concurrent process creations in one refill batch.
 fill_concurrency = 4
+# How many warm entries to create during server startup (0 skips the prewarm).
+prewarm_count = 2
 
 [memory_snapshot]
 # Generated OverlayBD config dedicated to memory snapshot devices.
