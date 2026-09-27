@@ -96,9 +96,21 @@ pub struct PooledBuffer {
 impl PooledBuffer {
     /// Convert the filled buffer into a shared read-only slice covering all
     /// its bytes. The underlying bytes are untouched; only ownership
-    /// changes, and the memory recycles when the last slice drops.
-    pub fn into_slice(mut self) -> SlabSlice {
+    /// changes, and the memory recycles when the last reference drops.
+    pub fn into_slice(self) -> SlabSlice {
         let len = self.data.len();
+        self.into_slice_len(len)
+    }
+
+    /// Convert the filled buffer into a shared read-only slice covering its
+    /// first `len` bytes. The tail stays unexposed inside the pooled buffer,
+    /// which recycles when the last reference drops.
+    pub fn into_slice_len(mut self, len: usize) -> SlabSlice {
+        let size = self.data.len();
+        assert!(
+            len <= size,
+            "slice len {len} exceeds pooled buffer size {size}"
+        );
         // Empty data keeps this value's Drop from recycling the buffer that
         // now lives inside the slice.
         let data = std::mem::take(&mut self.data);
@@ -280,5 +292,22 @@ mod tests {
         drop(slice);
         let _miss = FixedBufferPool::acquire(&pool);
         assert_eq!(pool.allocations(), 1);
+    }
+
+    #[test]
+    fn into_slice_len_windows_a_partial_buffer_and_recycles() {
+        let pool = FixedBufferPool::new(4096, 1);
+        let mut buffer = FixedBufferPool::acquire(&pool);
+        buffer.as_mut().fill(0xAB);
+        let window = buffer.into_slice_len(1000);
+        assert_eq!(window.len(), 1000);
+        assert_eq!(&window[..4], &[0xAB; 4]);
+        drop(window);
+        let _reused = FixedBufferPool::acquire(&pool);
+        assert_eq!(
+            pool.allocations(),
+            1,
+            "partially windowed buffer must recycle on last drop"
+        );
     }
 }
