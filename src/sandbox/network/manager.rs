@@ -3,17 +3,19 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use index_set::{slot_count, AtomicBitSet, BitSet, SharedBitSet};
 use ipnetwork::Ipv4Network;
 use nix::libc;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 
 use super::egress_proxy::EgressProxy;
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use super::{NetworkAddressPlan, NetworkError, Slot, HOST_VETH_PREFIX, MAX_SLOTS};
+use crate::sandbox::pool_prime::wait_until_primed;
 
 const CONFLICT_SAMPLE_LIMIT: usize = 5;
 const ERR_SHUTTING_DOWN: &str = "Network manager is shutting down";
@@ -43,7 +45,7 @@ struct NetworkManagerConfig {
     netns_dir: PathBuf,
 }
 
-pub(crate) struct NetworkManager {
+pub struct NetworkManager {
     /// Bitmap tracking allocated slots.
     allocated: AtomicBitSet<{ slot_count::from_bits(MAX_SLOTS) }>,
 
@@ -102,6 +104,37 @@ impl NetworkManager {
         MANAGER.get()
     }
 
+    /// Prewarm the slot pool to `[pool.network].prewarm_count` within
+    /// `timeout`. Best-effort: allocation falls back to on-demand creation.
+    pub async fn prime(timeout: Duration) -> Result<()> {
+        let cfg = crate::cfg::ConfigManager::global_config();
+        let pool_cfg = cfg.network_pool_config();
+        if !pool_cfg.maintenance_enabled {
+            debug!("network slot pool maintenance disabled; skipping prime");
+            return Ok(());
+        }
+        if !pool_cfg.startup_prewarm {
+            debug!("network slot pool startup prewarm disabled; skipping prime");
+            return Ok(());
+        }
+
+        let target = cfg.pool.network.prewarm_count;
+        let manager = Self::global();
+        if target == 0 || manager.pool.len() >= target {
+            return Ok(());
+        }
+
+        info!(
+            prewarm_count = target,
+            current = manager.pool.len(),
+            timeout_ms = timeout.as_millis(),
+            "priming network slot pool"
+        );
+        let _prewarm = manager.pool.prewarm_to(target);
+        wait_until_primed(&manager.pool, "network slot pool", target, timeout).await;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         maintenance_enabled: bool,
@@ -157,7 +190,7 @@ impl NetworkManager {
 
     /// Allocates a network slot with the given index atomically.
     #[cfg(test)]
-    pub fn allocate_slot(&self, idx: u32) -> Result<Slot> {
+    pub(crate) fn allocate_slot(&self, idx: u32) -> Result<Slot> {
         if idx == 0 || idx as usize >= MAX_SLOTS {
             return Err(anyhow!(
                 "Slot index {} out of range (max {})",
@@ -232,7 +265,7 @@ impl NetworkManager {
     ///
     /// Fast path: reuse a warm slot from the pool.
     /// Slow path: allocate a new index and set up kernel network resources.
-    pub fn allocate_any(&self) -> Result<Slot> {
+    pub(crate) fn allocate_any(&self) -> Result<Slot> {
         if self.shutting_down() {
             return Err(anyhow!(ERR_SHUTTING_DOWN));
         }
@@ -380,7 +413,7 @@ impl NetworkManager {
     ///
     /// When pool maintenance is disabled, this keeps the previous bounded-pool
     /// behavior and cleans up immediately once the pool reaches high watermark.
-    pub fn release(&self, mut slot: Slot) -> Result<()> {
+    pub(crate) fn release(&self, mut slot: Slot) -> Result<()> {
         if self.shutting_down() {
             return self.cleanup_slot_and_release_bit(slot);
         }

@@ -7,6 +7,7 @@ mod firecracker;
 #[cfg(test)]
 pub(crate) mod mock;
 mod network;
+mod pool_prime;
 mod process;
 mod ublk;
 
@@ -34,7 +35,8 @@ pub use firecracker::{
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig, FirecrackerSnapshotManifest,
 };
-pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
+pub(crate) use network::prepare_runtime as prepare_network_runtime;
+pub use network::NetworkManager;
 pub use network::{
     BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
     ALL_INTERNET_TRAFFIC_CIDR,

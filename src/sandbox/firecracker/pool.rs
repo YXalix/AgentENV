@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
@@ -20,9 +20,9 @@ use super::config::create_firecracker_work_dir;
 use super::FirecrackerInstance;
 use crate::cfg::{ConfigManager, ResolvedFirecrackerPoolConfig};
 use crate::sandbox::network::{NetworkManager, Slot};
+use crate::sandbox::pool_prime::wait_until_primed;
 
 const POOL_FIRECRACKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
-const POOL_PRIME_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 static POOL: OnceLock<Option<FirecrackerPool>> = OnceLock::new();
 
@@ -206,25 +206,8 @@ impl FirecrackerPool {
             "priming firecracker pool"
         );
 
-        let started = Instant::now();
-        loop {
-            if pool.warm_len() >= target {
-                info!(
-                    warm = pool.warm_len(),
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "firecracker pool primed"
-                );
-                return Ok(());
-            }
-            if started.elapsed() >= timeout {
-                warn!(
-                    warm = pool.warm_len(),
-                    target, "firecracker pool prime timed out; continuing with partial warm-up"
-                );
-                return Ok(());
-            }
-            tokio::time::sleep(POOL_PRIME_POLL_INTERVAL).await;
-        }
+        wait_until_primed(&pool.pool, "firecracker pool", target, timeout).await;
+        Ok(())
     }
 
     fn run_maintenance_cycle(&self) -> Result<()> {

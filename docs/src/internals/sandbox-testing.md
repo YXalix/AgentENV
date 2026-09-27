@@ -284,6 +284,7 @@ enabled = false
   - `[pool.network].maintenance_enabled`: Enables the background network-slot maintenance worker. Defaults to `true`.
   - `[pool.block].enabled`: Enables the ublk overlaybd warm-device pool.
   - `[pool.firecracker].enabled`: Enables pre-spawned Firecracker processes for snapshot resume.
+  - `[pool.network].prewarm_count`: Warm network slots created during server startup. Defaults to `2`; `0` disables. Refills follow the pool watermarks afterwards.
 
 - `[snapshot]`
   - `local_cache_path`: Manager-owned node-local snapshot artifact/cache root. Defaults to `$AENV_HOME/snapshot-local-cache`.

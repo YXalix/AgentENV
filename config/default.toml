@@ -302,6 +302,9 @@ high_watermark = 64
 [pool.network]
 # Refill the network-slot pool in the background.
 maintenance_enabled = true
+# Warm slots to create during server startup (0 disables); refills follow
+# the pool watermarks afterwards.
+prewarm_count = 2
 
 [pool.block]
 # Enable the reusable OverlayBD ublk-device pool.

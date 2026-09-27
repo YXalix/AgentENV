@@ -10,7 +10,7 @@
 //! Resource-specific create/reset/delete logic is provided via trait hooks.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 /// Action computed by watermark logic for the maintenance worker.
@@ -93,6 +93,8 @@ pub struct WarmPool<T: Send> {
     /// keeps extra warm capacity instead of shrinking back to cold-start
     /// behavior.
     fill_target: Mutex<usize>,
+    /// Idle floor held while a `prewarm_to` guard is alive; 0 otherwise.
+    prewarm_floor: AtomicUsize,
     /// Background maintenance worker state.
     maintenance_signal: Mutex<PoolMaintenanceSignal>,
     /// Wakes the maintenance worker.
@@ -113,6 +115,7 @@ impl<T: Send> WarmPool<T> {
         Self {
             pool: Mutex::new(VecDeque::new()),
             fill_target: Mutex::new(fill_target),
+            prewarm_floor: AtomicUsize::new(0),
             config,
             maintenance_signal: Mutex::new(PoolMaintenanceSignal::default()),
             maintenance_cv: Condvar::new(),
@@ -164,7 +167,10 @@ impl<T: Send> WarmPool<T> {
     }
 
     fn current_fill_target(&self) -> usize {
-        (*self.fill_target.lock().unwrap()).min(self.config.high_watermark)
+        let prewarm_floor = self.prewarm_floor.load(Ordering::Acquire);
+        (*self.fill_target.lock().unwrap())
+            .max(prewarm_floor)
+            .min(self.config.high_watermark)
     }
 
     fn grow_fill_target_after_pressure(&self, pool_len: usize) {
@@ -204,6 +210,20 @@ impl<T: Send> WarmPool<T> {
         }
         signal.pending = true;
         self.maintenance_cv.notify_one();
+    }
+
+    /// Raise the idle floor to at least `target` (capped at the high
+    /// watermark) until the returned guard drops.
+    #[must_use = "dropping the guard immediately clears the prewarm floor"]
+    pub fn prewarm_to(&self, target: usize) -> PrewarmGuard<'_, T> {
+        let prev_floor = self
+            .prewarm_floor
+            .fetch_max(target.min(self.config.high_watermark), Ordering::AcqRel);
+        self.request_maintenance();
+        PrewarmGuard {
+            pool: self,
+            prev_floor,
+        }
     }
 
     /// Try to acquire a resource from the pool (fast path).
@@ -391,6 +411,22 @@ impl<T: Send> WarmPool<T> {
     }
 }
 
+/// Scoped prewarm floor for [`WarmPool::prewarm_to`]; drop restores
+/// watermark-driven refills.
+pub struct PrewarmGuard<'a, T: Send> {
+    pool: &'a WarmPool<T>,
+    prev_floor: usize,
+}
+
+impl<T: Send> Drop for PrewarmGuard<'_, T> {
+    fn drop(&mut self) {
+        self.pool
+            .prewarm_floor
+            .store(self.prev_floor, Ordering::Release);
+        self.pool.request_maintenance();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,6 +548,83 @@ mod tests {
         assert_eq!(
             pool.compute_maintenance_action(4),
             PoolMaintenanceAction::Idle
+        );
+    }
+
+    #[test]
+    fn prewarm_to_raises_transient_floor_and_requests_maintenance() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+        });
+
+        let _prewarm = pool.prewarm_to(6);
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Fill(6)
+        );
+        assert!(pool.maintenance_signal.lock().unwrap().pending);
+
+        // Capped at the high watermark, and never lowered.
+        let _higher = pool.prewarm_to(64);
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Fill(10)
+        );
+        let _lower = pool.prewarm_to(1);
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Fill(10)
+        );
+    }
+
+    #[test]
+    fn prewarm_guard_drop_restores_watermark_governance() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+        });
+
+        let prewarm = pool.prewarm_to(6);
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Fill(6)
+        );
+
+        drop(prewarm);
+        // Refills fall back to the watermark target; only the high watermark
+        // drains, so idle entries above the target are kept.
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Fill(2)
+        );
+        assert_eq!(
+            pool.compute_maintenance_action(5),
+            PoolMaintenanceAction::Idle
+        );
+        assert!(pool.maintenance_signal.lock().unwrap().pending);
+    }
+
+    #[test]
+    fn pressure_growth_during_prewarm_survives_guard_drop() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+        });
+
+        let prewarm = pool.prewarm_to(6);
+        // Pressure during prewarm still ratchets the persistent fill target.
+        assert_eq!(pool.try_acquire(), None);
+        drop(prewarm);
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Fill(4)
         );
     }
 

@@ -7,7 +7,9 @@ use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
-use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
+use agentenv::sandbox::{
+    FirecrackerPool, FirecrackerSandboxFactory, NetworkManager, UblkDeviceManager,
+};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
 use agentenv::volume::{VolumeLimits, VolumeManager};
@@ -108,6 +110,10 @@ async fn run() -> anyhow::Result<()> {
         overlaybd_p2p.publish_address(),
     )
     .await?;
+
+    if let Err(err) = NetworkManager::prime(std::time::Duration::from_secs(10)).await {
+        warn!(target: "agentenv", error = %err, "network slot pool prime failed; continuing startup");
+    }
 
     if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
         warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");

@@ -205,7 +205,7 @@ pub struct PoolTomlConfig {
     #[config(default = 64usize)]
     pub high_watermark: usize,
     #[config(nested)]
-    pub network: PoolComponentConfig,
+    pub network: NetworkPoolConfig,
     #[config(nested)]
     pub block: PoolComponentConfig,
     #[config(nested)]
@@ -220,6 +220,19 @@ pub struct PoolComponentConfig {
     pub maintenance_enabled: bool,
     #[config(default = true)]
     pub startup_prewarm: bool,
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct NetworkPoolConfig {
+    #[config(default = true)]
+    pub enabled: bool,
+    #[config(default = true)]
+    pub maintenance_enabled: bool,
+    #[config(default = true)]
+    pub startup_prewarm: bool,
+    /// Warm network slots to create during server startup (`0` disables).
+    #[config(default = 2usize)]
+    pub prewarm_count: usize,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -660,6 +673,7 @@ impl_config_default!(
     FirecrackerConfig,
     PoolTomlConfig,
     PoolComponentConfig,
+    NetworkPoolConfig,
     FirecrackerProcessPoolConfig,
     KernelConfig,
     ToolsConfig,
@@ -1165,6 +1179,14 @@ impl AppConfig {
         let network = self.network_pool_config();
         if network.maintenance_enabled {
             PoolTomlConfig::validate("network", &network)?;
+            let prewarm_count = self.pool.network.prewarm_count;
+            if prewarm_count > network.high_watermark {
+                bail!(
+                    "invalid network pool config: prewarm_count ({}) must be <= high_watermark ({})",
+                    prewarm_count,
+                    network.high_watermark
+                );
+            }
         }
         if let Some(block) = self.block_pool_config() {
             PoolTomlConfig::validate("block", &block)?;
@@ -2034,9 +2056,9 @@ mod tests {
             pool: PoolTomlConfig {
                 low_watermark: 64,
                 high_watermark: 32,
-                network: PoolComponentConfig {
+                network: NetworkPoolConfig {
                     maintenance_enabled: false,
-                    ..PoolComponentConfig::default()
+                    ..NetworkPoolConfig::default()
                 },
                 block: PoolComponentConfig {
                     enabled: false,
@@ -2069,6 +2091,29 @@ mod tests {
         let err = config.validate_pool_config().unwrap_err();
         assert!(
             err.to_string().contains("fill_concurrency"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn network_pool_prewarm_count_rejects_above_high_watermark() {
+        let config = AppConfig {
+            pool: PoolTomlConfig {
+                high_watermark: 4,
+                network: NetworkPoolConfig {
+                    enabled: true,
+                    maintenance_enabled: true,
+                    prewarm_count: 8,
+                    ..NetworkPoolConfig::default()
+                },
+                ..PoolTomlConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        let err = config.validate_pool_config().unwrap_err();
+        assert!(
+            err.to_string().contains("prewarm_count"),
             "unexpected error: {err}"
         );
     }
