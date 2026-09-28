@@ -352,6 +352,13 @@ fill_concurrency = 4
 # OverlayBD path. Disable with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
 track_dirty_pages = true
 
+# Compress memory layers as ZFile when pausing instead of leaving them raw.
+# Disabled by default so local pause/resume pays no decompression cost. The
+# algorithm and worker count come from [snapshot.publish_compression], so
+# pause artifacts stay in the format publish uploads and pass through
+# unchanged.
+compression_enabled = false
+
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd
 # becomes ready.

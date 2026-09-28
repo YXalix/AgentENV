@@ -530,6 +530,13 @@ pub struct MemorySnapshotConfig {
     /// Default: true; set the environment variable to false to use mincore.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
     pub track_dirty_pages: bool,
+    /// Compress memory snapshot layers as ZFile when pausing instead of
+    /// leaving them raw. Default: false so local pause/resume keeps paying
+    /// no decompression cost; enabled, the algorithm and worker count come
+    /// from `[snapshot.publish_compression]` so pause artifacts stay in the
+    /// same format publish uploads and are passed through unchanged.
+    #[config(default = false)]
+    pub compression_enabled: bool,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
@@ -1483,6 +1490,23 @@ mod tests {
     fn bundled_default_config_loads() -> Result<()> {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn memory_snapshot_compression_config_is_valid() -> Result<()> {
+        let default = MemorySnapshotConfig::default();
+        assert!(!default.compression_enabled);
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        assert!(!config.config().memory_snapshot.compression_enabled);
+
+        let temp = tempdir()?;
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "[memory_snapshot]\ncompression_enabled = true\n")?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert!(config.config().memory_snapshot.compression_enabled);
         Ok(())
     }
 

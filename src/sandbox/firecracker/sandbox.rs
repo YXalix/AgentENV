@@ -1182,10 +1182,17 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
-        // Local layers are always captured raw; when enabled, compression
-        // happens once at publish time under `[snapshot.publish_compression]`.
+        // Memory layers stay raw unless `[memory_snapshot].compression_enabled`
+        // opts pause into ZFile output; the algorithm and workers come from
+        // `[snapshot.publish_compression]`, so publish uploads the zfile bytes
+        // unchanged instead of recompressing them.
+        let global_config = ConfigManager::global_config();
+        let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
+            &global_config.memory_snapshot,
+            &global_config.snapshot.publish_compression,
+        );
         let (mem_layer_path, mem_virtual_size) = self
-            .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, OverlaybdCompactOutput::Raw)
+            .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
             .await?;
 
         // Build the memory image config: collect parent layers, make runtime
@@ -1201,7 +1208,7 @@ impl FirecrackerSandbox {
             resume_mem_image_config_path,
             &mem_layer_path,
             snapshot_dir,
-            OverlaybdCompactOutput::Raw,
+            memory_output,
         )
         .await?;
         let mem_image_config_path = snapshot_dir.join("mem_image.json");
