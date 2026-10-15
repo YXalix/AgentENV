@@ -42,6 +42,12 @@ pub(crate) const SANDBOX_TAP_IFACE_NAME: &str = "tap0";
 /// it is told about, so replacing an inherited one here is safe.
 const NET_TAP_FD: RawFd = 3;
 
+/// `RLIMIT_NOFILE` (soft and hard) for the spawned Firecracker process:
+/// `resize_fdtable` pre-grows the kernel fd table to the soft limit, and 2048
+/// is the jailer default — far above what a microVM build opens, but small
+/// enough that the table costs pages instead of megabytes.
+const FIRECRACKER_NOFILE_LIMIT: u64 = 2048;
+
 /// Hands Firecracker the sandbox TAP queue as a pre-opened, pre-configured
 /// descriptor (an `fdp:` `host_dev_name` spec) instead of letting it open the
 /// interface by name inside the sandbox network namespace.
@@ -161,8 +167,20 @@ impl FirecrackerInstance {
         let stderr = open_log_stdio(stderr_path)?;
         self.stderr_path = stderr_path.map(Path::to_path_buf);
 
+        // Firecracker pre-grows its kernel fd table to the soft RLIMIT_NOFILE at
+        // startup (`resize_fdtable` dups stdin onto `limit - 1`), so with the
+        // server unit's `LimitNOFILE=1048576` every process start pays a
+        // multi-megabyte fd-table allocation that stalls in memory reclaim.
+        // glibc's posix_spawn has no rlimit attribute, and a pre_exec hook would
+        // force a fork+exec of the server; prlimit applies the capped limit and
+        // execs Firecracker in place, keeping the pid, process group, netns,
+        // and descriptor handoff unchanged.
         let spec = ScopedSpawnSpec {
             argv: vec![
+                CString::from(c"/usr/bin/prlimit"),
+                CString::new(format!("--nofile={FIRECRACKER_NOFILE_LIMIT}"))
+                    .expect("numeric literal is NUL-free"),
+                CString::from(c"--"),
                 path_to_cstring(&firecracker_binary)?,
                 CString::from(c"--api-sock"),
                 path_to_cstring(&self.socket_path)?,
