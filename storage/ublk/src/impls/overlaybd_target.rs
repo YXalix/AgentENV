@@ -1,10 +1,10 @@
 use anyhow::{bail, Context, Result};
-use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use clap::Args;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
 use overlaybd::virtual_file::{IoCtx, VirtualFile};
+use parking_lot::RwLock;
 use std::fmt;
 use std::io::ErrorKind;
 use std::mem::size_of;
@@ -46,13 +46,18 @@ pub struct OverlaybdTargetConfig {
 }
 
 pub struct OverlaybdTarget {
-    state: ArcSwap<TargetState>,
-    recorder: ArcSwapOption<StartupPackRecorder>,
+    // RwLock of Arc instead of ArcSwap: an ArcSwap writer must wait for all
+    // readers of the old value (its global thread-node traversal spins), which
+    // stalls every warm-pool swap_state under high pause/resume concurrency.
+    // Swaps are rare and readers hold the lock for a clone, so shared-lock
+    // traffic is negligible.
+    state: RwLock<Arc<TargetState>>,
+    recorder: RwLock<Option<Arc<StartupPackRecorder>>>,
 }
 
 impl fmt::Debug for OverlaybdTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.state.load();
+        let state = self.current_state();
         f.debug_struct("OverlaybdTarget")
             .field("image_config_path", &state.image_config_path)
             .field("dev_sectors", &state.dev_sectors)
@@ -121,16 +126,22 @@ impl OverlaybdTarget {
         };
 
         Ok(Self {
-            state: ArcSwap::new(Arc::new(state)),
-            recorder: ArcSwapOption::new(None),
+            state: RwLock::new(Arc::new(state)),
+            recorder: RwLock::new(None),
         })
+    }
+
+    /// Snapshot the current target state; the returned Arc stays valid across
+    /// concurrent swaps and awaits.
+    fn current_state(&self) -> Arc<TargetState> {
+        self.state.read().clone()
     }
 
     /// Attach (or detach with `None`) a startup-pack first-touch recorder.
     /// Only the dedicated memory device of a pack-recording VM arms this;
     /// rootfs and normal memory devices never do.
     pub fn set_recorder(&self, recorder: Option<Arc<StartupPackRecorder>>) {
-        self.recorder.store(recorder);
+        *self.recorder.write() = recorder;
     }
 
     /// Swap the target's backing image and capacity atomically.
@@ -167,8 +178,8 @@ impl OverlaybdTarget {
         // Per-image attachments must not survive a swap: a pooled device
         // reused for another image would otherwise keep recording for the
         // previous image.
-        self.recorder.store(None);
-        self.state.store(Arc::new(new_state));
+        *self.recorder.write() = None;
+        *self.state.write() = Arc::new(new_state);
         Ok(())
     }
 
@@ -203,7 +214,8 @@ impl OverlaybdTarget {
         // the guard settles in-flight and latency accounting on completion.
         // The remote estimate only counts reads that touched new pages, so
         // re-reads of already-recorded pages cannot trip the abort guard.
-        let _read_guard = self.recorder.load_full().map(|recorder| {
+        let recorder = self.recorder.read().clone();
+        let _read_guard = recorder.map(|recorder| {
             let touched_new = recorder.observe_submit(offset, len);
             recorder.read_guard(len as u64, touched_new)
         });
@@ -342,7 +354,7 @@ impl UVMUblkTarget for OverlaybdTarget {
     }
 
     fn ublk_dev_params(&self, dev_info: &ublk_sys::ublksrv_ctrl_dev_info) -> ublk_sys::ublk_params {
-        let state = self.state.load();
+        let state = self.current_state();
         build_ublk_params(
             state.dev_sectors,
             state.logical_bs_shift,
@@ -361,7 +373,7 @@ impl UVMUblkTarget for OverlaybdTarget {
         _extra: Option<&mut IOBuffer>,
         io_ring: &AsyncIoRing,
     ) -> i32 {
-        let state = self.state.load_full();
+        let state = self.current_state();
         let (op, offset, len) = match self.request_meta(&state, io_desc) {
             Ok(meta) => meta,
             Err(err) => {
@@ -582,7 +594,7 @@ mod tests {
         let reopened = OverlaybdTarget::open(&global_config, &image_config)
             .await
             .expect("reopen target");
-        let state = reopened.state.load_full();
+        let state = reopened.current_state();
         let got = state
             .image
             .read_at(0, 4096)
