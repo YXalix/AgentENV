@@ -1,4 +1,4 @@
-use std::{error::Error as StdError, future::Future, time::Duration};
+use std::{error::Error as StdError, future::Future, time::Duration, time::Instant};
 
 use axum::{
     body::Body,
@@ -450,8 +450,13 @@ async fn proxy_http_request(
 
     let upstream_method = parts.method.clone();
     let upstream_uri_for_log = upstream_uri.clone();
+    let path_class = envd_path_class(upstream_uri_for_log.path());
     let is_stream_input =
         is_envd_stream_input_request(&upstream_method, upstream_uri_for_log.path());
+    // TTFB(envd 响应头到达)是 guest 侧延迟信号:与 SDK e2e、
+    // agentenv_http_request_duration_seconds(server 侧总时长)三点拆分,
+    // 即可归因 exec 劣化在 guest 排队还是 server 排队。
+    let request_started = Instant::now();
     if is_stream_input {
         info!(
             sandbox_id = %sandbox_id,
@@ -463,12 +468,23 @@ async fn proxy_http_request(
 
     let (body, activity_rx) = track_request_body_activity(body);
     let upstream_request = Request::from_parts(parts, body);
-    let upstream_response_result = match wait_for_upstream_response_headers_with_activity_timeout(
+    let upstream_headers = wait_for_upstream_response_headers_with_activity_timeout(
         api_impl.proxy_client().request(upstream_request),
         activity_rx,
     )
-    .await
-    {
+    .await;
+    metrics::histogram!(
+        "agentenv_proxy_envd_ttfb_seconds",
+        "path_class" => path_class,
+        "outcome" => match &upstream_headers {
+            Err(_) => "timeout",
+            Ok(Err(_)) => "error",
+            Ok(Ok(_)) => "ok",
+        },
+    )
+    .record(request_started.elapsed().as_secs_f64());
+
+    let upstream_response_result = match upstream_headers {
         Ok(result) => result,
         Err(_) => {
             warn!(
@@ -561,6 +577,15 @@ where
 
 fn is_envd_stream_input_request(method: &Method, path: &str) -> bool {
     *method == Method::POST && path == ENVD_STREAM_INPUT_PATH
+}
+
+/// exec 生命周期 RPC(process.Process/*)单列一类,便于与其它 envd 流量区分。
+fn envd_path_class(path: &str) -> &'static str {
+    if path.starts_with("/process.Process/") {
+        "exec"
+    } else {
+        "other"
+    }
 }
 
 fn is_benign_stream_input_disconnect(
