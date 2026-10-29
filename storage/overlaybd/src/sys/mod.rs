@@ -18,6 +18,7 @@ use std::fmt;
 
 use nix::errno::Errno;
 
+mod boot_id;
 mod fs_space;
 mod open_flags;
 mod page_cache;
@@ -26,6 +27,7 @@ mod reserve_space;
 mod sparse;
 mod xattr;
 
+pub use boot_id::boot_id;
 pub use fs_space::fs_space;
 pub use open_flags::{direct_io_open_flag, enable_direct_io};
 pub use page_cache::evict_page_cache;

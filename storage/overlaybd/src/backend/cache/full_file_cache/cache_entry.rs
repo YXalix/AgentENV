@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 use zerocopy::U64;
 
 use super::super::meta::{
-    fsync, now_unix_nanos, BlockLoadState, CacheMetaDisk, CacheMetaDiskHeader, EntryPaths,
+    now_unix_nanos, BlockLoadState, CacheMetaDisk, CacheMetaDiskHeader, EntryPaths,
 };
 use super::cache_pool::FileCacheBackendOptions;
 use crate::sys;
@@ -604,19 +604,28 @@ impl CacheEntry {
         full_blocks_bytes.saturating_add(last_block_bytes)
     }
 
-    /// Write a crash-safe checkpoint for the cache entry (metadata):
-    ///   1. Sync the data file (ensures all written blocks are on disk)
-    ///   2. Write meta.bin atomically (tmp → fsync → rename)
+    /// Write a crash-safe checkpoint for the cache entry: snapshot the bitmap
+    /// and atomically replace meta.bin (tmp → rename) under the eviction
+    /// barrier.
+    ///
+    /// Durability model is process-crash only, so there is no fsync anywhere:
+    /// the mmap-written data pages and the rename itself live in the page
+    /// cache, which survives process death, and runtime reads are served from
+    /// that same page cache. A host reboot kills the page cache and the whole
+    /// cache with it via the boot marker, so no persisted meta can outlive
+    /// the pages it describes; forcing pages to disk here would only add
+    /// journal commits competing with co-tenants of the disk.
     ///
     /// After a crash, the persisted bitmap may be a subset of blocks that
     /// are actually on disk. This is safe — the missing blocks will just
     /// be re-fetched from the remote source.
     pub(crate) async fn checkpoint(&self) -> Result<()> {
-        // Keep checkpoint publication ordered with logical eviction. Without
-        // this permit, an older bitmap snapshot could recreate meta.bin after
-        // eviction punched the data file and cleared the in-memory bitmap.
+        // Hold the read permit across snapshot and rename so a concurrent
+        // eviction (write permit) can never interleave: the published bitmap
+        // can never claim blocks the eviction punched.
         let _barrier = self.refill_eviction_barrier.read().await;
         let bitmap_snapshot = self.index.read().clone();
+        let index_len = bitmap_snapshot.len();
 
         let meta = CacheMetaDisk {
             header: CacheMetaDiskHeader {
@@ -631,12 +640,12 @@ impl CacheEntry {
             key: self.key.clone(),
             bitmap: bitmap_snapshot,
         };
-
-        // Step 1: fsync data file
-        fsync(&self.data_file).await?;
-        // Step 2: write meta.bin atomically (tmp → fsync → rename)
         meta.write_to_path(&self.paths.meta_path).await?;
-        self.dirty.store(false, Ordering::Relaxed);
+        // A refill may have grown the index while we checkpointed; leave
+        // dirty set so the next round persists the growth too.
+        if self.index.read().len() == index_len {
+            self.dirty.store(false, Ordering::Relaxed);
+        }
         Ok(())
     }
 

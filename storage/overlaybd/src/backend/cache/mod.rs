@@ -36,6 +36,9 @@ const DEFAULT_CAPACITY_BYTES: u64 = 4 * GIB;
 const DEFAULT_DISK_AVAIL_BYTES: u64 = 128 * 1024 * 1024;
 const DATA_FILE_NAME: &str = "data";
 const META_FILE_NAME: &str = "meta.bin";
+/// Written at startup with `sys::boot_id`; on mismatch the whole cache from
+/// the previous boot is discarded (its page cache died with the host).
+const BOOT_MARKER_FILE_NAME: &str = "boot.marker";
 const MAX_PREFETCH_SIZE: u64 = 32 * 1024 * 1024;
 const MAX_FREE_SPACE_BYTES: u64 = 50 * GIB;
 const EVICTION_MARK_BYTES: u64 = 5 * GIB;

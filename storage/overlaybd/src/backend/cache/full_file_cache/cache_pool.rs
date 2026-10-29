@@ -1,7 +1,7 @@
 use super::super::meta::EntryPaths;
 use super::super::{
-    cache_key_digest, div_round_up, CacheFnTransFunc, DEFAULT_BLOCK_SIZE, DEFAULT_CACHE_DIR,
-    DEFAULT_CAPACITY_BYTES, DEFAULT_CHECKPOINT_PERIOD, DEFAULT_DISK_AVAIL_BYTES,
+    cache_key_digest, div_round_up, CacheFnTransFunc, BOOT_MARKER_FILE_NAME, DEFAULT_BLOCK_SIZE,
+    DEFAULT_CACHE_DIR, DEFAULT_CAPACITY_BYTES, DEFAULT_CHECKPOINT_PERIOD, DEFAULT_DISK_AVAIL_BYTES,
     DEFAULT_EVICTION_PERIOD, EVICTION_MARK_BYTES, GIB, MAX_FREE_SPACE_BYTES, PAGE_SIZE,
     WATERMARK_RATIO,
 };
@@ -11,10 +11,10 @@ use crate::config::CacheConfig;
 use crate::io::virtual_file::VirtualFile;
 use crate::lsmt::file::PREMERGED_INDEX_DIR;
 use crate::sys;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::Notify;
@@ -192,6 +192,7 @@ impl BackendState {
     pub(crate) async fn load_from_disk(options: &FileCacheBackendOptions) -> Result<Self> {
         let state = Self::new();
         std::fs::create_dir_all(&options.cache_dir)?;
+        Self::discard_stale_boot_cache(&options.cache_dir)?;
         for item in std::fs::read_dir(&options.cache_dir)? {
             let item = item?;
             if !item.file_type()?.is_dir() {
@@ -224,6 +225,53 @@ impl BackendState {
         FileCacheBackend::publish_pressure_locked(&state, options, disk);
         drop(_pressure_guard);
         Ok(state)
+    }
+
+    /// Detect a host reboot and discard everything the previous boot
+    /// persisted.
+    ///
+    /// The checkpoint durability model is process-crash only: checkpointed
+    /// data pages and renames live in the page cache, which dies with the
+    /// host. [`sys::boot_id`] changes on every boot, so a marker in the cache
+    /// root tells whether the page cache the persisted metas describe is
+    /// still the one serving reads. On mismatch every previous-boot entry
+    /// directory is removed — keeping any of them would risk serving blocks
+    /// whose pages are gone. Every failure direction here lands on a cold
+    /// cache, never on a false cache hit.
+    fn discard_stale_boot_cache(cache_dir: &Path) -> Result<()> {
+        let marker_path = cache_dir.join(BOOT_MARKER_FILE_NAME);
+        let boot = sys::boot_id();
+        // A missing boot id (unsupported platform) or a missing/foreign
+        // marker counts as a reboot.
+        let same_boot = match (&boot, std::fs::read_to_string(&marker_path)) {
+            (Ok(boot), Ok(stored)) => stored.trim() == boot.as_str(),
+            _ => false,
+        };
+        if same_boot {
+            return Ok(());
+        }
+        // Remove previous-boot entry dirs BEFORE refreshing the marker: if a
+        // removal fails, the marker stays stale and the next startup retries
+        // instead of loading metas the removal never cleared.
+        for item in std::fs::read_dir(cache_dir)? {
+            let item = item?;
+            if !item.file_type()?.is_dir() {
+                continue;
+            }
+            // The LSMT premerged-index artifact cache shares this cache root
+            // but is not a full-file cache entry; leave it untouched.
+            if item.file_name().to_string_lossy() == PREMERGED_INDEX_DIR {
+                continue;
+            }
+            std::fs::remove_dir_all(item.path())
+                .with_context(|| format!("discard stale cache entry {}", item.path().display()))?;
+        }
+        // Best-effort: losing the marker only downgrades the next boot to a
+        // cold cache as well.
+        if let Ok(boot) = boot {
+            let _ = std::fs::write(&marker_path, boot);
+        }
+        Ok(())
     }
 }
 
@@ -348,8 +396,8 @@ impl FileCacheBackend {
     }
 
     /// Start a background task that wake up every [DEFAULT_CHECKPOINT_PERIOD],
-    /// and iterate all cache entries one by one, sync the data file and
-    /// re-flush the cache metadata on local disk.
+    /// and iterate all dirty cache entries one by one to checkpoint their
+    /// metadata (tmp write + rename; no flush) on local disk.
     fn start_checkpoint_worker(&self) {
         let weak_state = Arc::downgrade(&self.state);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -388,6 +436,13 @@ impl FileCacheBackend {
             });
     }
 
+    /// Run one checkpoint round immediately (test hook; production runs this
+    /// on the [DEFAULT_CHECKPOINT_PERIOD] worker).
+    #[cfg(test)]
+    pub(crate) async fn run_checkpoint_round(&self) {
+        Self::checkpoint_dirty_entries(&self.state).await;
+    }
+
     async fn checkpoint_dirty_entries(state: &BackendState) {
         // NOTE: do not iterator dashmap across await point
         let dirty_entries = state
@@ -403,6 +458,8 @@ impl FileCacheBackend {
             })
             .collect::<Vec<_>>();
         for entry in dirty_entries {
+            // Best-effort: a failed checkpoint leaves the entry dirty and the
+            // next round retries it.
             let _ = entry.checkpoint().await;
         }
     }

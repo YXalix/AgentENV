@@ -1014,6 +1014,99 @@ async fn test_cache_hit_after_first_read() {
 }
 
 #[tokio::test]
+async fn test_boot_marker_invalidates_cache_after_reboot() {
+    let tmp = tempdir().expect("create tempdir");
+    let payload: Vec<u8> = (0..1024).map(|x| (x % 251) as u8).collect();
+    let key = "reboot-key";
+    let cache_id;
+    let forged_marker = "00000000-0000-0000-0000-000000000000";
+
+    {
+        let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+            .await
+            .expect("backend init");
+        let src = Arc::new(MockSource::new(payload.clone(), Duration::ZERO));
+        let file = backend.open_file(key, src).await.expect("open cached file");
+        file.read_at(0, 256).await.expect("populate cache");
+        backend.run_checkpoint_round().await;
+        let entry = backend
+            .get_cache_entry(&super::cache_key_digest(key))
+            .expect("cache entry");
+        cache_id = entry.cache_id.clone();
+        assert!(entry.paths.meta_path.exists(), "meta.bin published");
+    }
+
+    // A reboot killed the page cache the persisted metas describe, so every
+    // entry from the previous boot must be discarded.
+    std::fs::write(tmp.path().join(BOOT_MARKER_FILE_NAME), forged_marker)
+        .expect("forge stale boot marker");
+    let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+        .await
+        .expect("backend after reboot");
+    assert!(
+        !tmp.path().join(&cache_id).exists(),
+        "previous-boot entry dir must be removed"
+    );
+    let marker =
+        std::fs::read_to_string(tmp.path().join(BOOT_MARKER_FILE_NAME)).expect("read marker");
+    assert_ne!(
+        marker.trim(),
+        forged_marker,
+        "startup must refresh the marker to the current boot"
+    );
+
+    let src = Arc::new(MockSource::new(payload.clone(), Duration::ZERO));
+    let file = backend.open_file(key, src.clone()).await.expect("reopen");
+    let got = file.read_at(0, 256).await.expect("read after reboot");
+    assert_eq!(got.as_ref(), &payload[..256]);
+    assert!(
+        src.read_calls() > 0,
+        "reboot must not serve stale cache warm"
+    );
+}
+
+#[tokio::test]
+async fn test_batch_checkpoint_round_publishes_and_survives_reload() {
+    let tmp = tempdir().expect("create tempdir");
+    let payload: Vec<u8> = (0..1024).map(|x| (x % 127) as u8).collect();
+
+    {
+        let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+            .await
+            .expect("backend init");
+        let keys = ["batch-a", "batch-b"];
+        for key in keys {
+            let src = Arc::new(MockSource::new(payload.clone(), Duration::ZERO));
+            let file = backend.open_file(key, src).await.expect("open cached file");
+            file.read_at(0, 256).await.expect("populate cache");
+        }
+        // One round checkpoints every dirty entry (tmp write + rename).
+        backend.run_checkpoint_round().await;
+        for key in keys {
+            let entry = backend
+                .get_cache_entry(&super::cache_key_digest(key))
+                .expect("cache entry");
+            assert!(
+                !entry.dirty.load(Ordering::Relaxed),
+                "{key} should be clean after the round"
+            );
+            assert!(entry.paths.meta_path.exists(), "{key} meta.bin published");
+        }
+    }
+
+    let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+        .await
+        .expect("backend 2");
+    for key in ["batch-a", "batch-b"] {
+        let src = Arc::new(MockSource::new(payload.clone(), Duration::ZERO));
+        let file = backend.open_file(key, src.clone()).await.expect("reopen");
+        let got = file.read_at(0, 256).await.expect("read cached");
+        assert_eq!(got.as_ref(), &payload[..256]);
+        assert_eq!(src.read_calls(), 0, "{key} must reload warm");
+    }
+}
+
+#[tokio::test]
 async fn test_cache_persistence_reload() {
     let tmp = tempdir().expect("create tempdir");
     let payload: Vec<u8> = (0..1024).map(|x| (x % 127) as u8).collect();
@@ -1225,7 +1318,7 @@ async fn test_checkpoint_preserves_cache() {
             .expect("open cached file");
         let _ = file.read_at(0, 4096).await.expect("populate cache");
         assert_eq!(src.read_calls(), 1);
-        // Checkpoint with crash-safe ordering: fsync data, write meta.bin.
+        // Checkpoint: snapshot bitmap, atomically replace meta.bin.
         if let Some(entry) = backend.get_cache_entry(&super::cache_key_digest("checkpoint-key")) {
             entry.checkpoint().await.expect("checkpoint");
         }

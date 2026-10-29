@@ -1,9 +1,7 @@
 use anyhow::anyhow;
 use anyhow::{ensure, Context, Result};
-use nix::errno::Errno;
 use roaring::RoaringBitmap;
 use std::io::Write;
-use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 use std::task::Waker;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -171,13 +169,21 @@ impl CacheMetaDisk {
         })
     }
 
-    /// Write atomically to `path` using crash-safe ordering:
-    ///   1. Write tmp file
-    ///   2. fsync tmp file
-    ///   3. Rename tmp → target
+    /// Load from `path`. Returns `None` if file does not exist.
+    pub(crate) async fn load_from_path(path: &Path) -> Result<Self> {
+        let raw = tokio::fs::read(path).await?;
+        Self::from_bytes(&raw)
+    }
+
+    /// Write atomically to `path`: write a tmp file, then rename over the
+    /// target.
     ///
-    /// The caller is responsible for syncing the data file *before* calling
-    /// this method if crash-safe data↔metadata consistency is required.
+    /// Deliberately no fsync: the checkpoint durability model is
+    /// process-crash only. The page cache and the rename both survive process
+    /// death, and a host reboot discards the whole cache via the boot marker,
+    /// so forcing these bytes to disk would only add journal commits
+    /// competing with co-tenants of the disk. A torn or stale meta.bin is
+    /// rejected by CRC on load.
     pub(crate) async fn write_to_path(&self, meta_path: &Path) -> Result<()> {
         let raw = self.to_bytes()?;
         let dir = meta_path
@@ -185,10 +191,8 @@ impl CacheMetaDisk {
             .context("meta_path has no parent directory")?;
         let tmp = dir.join(format!("meta.tmp-{}", uuid::Uuid::new_v4()));
 
-        // Write and fsync the tmp file.
         let mut f = tokio::fs::File::create(&tmp).await?;
         <tokio::fs::File as tokio::io::AsyncWriteExt>::write_all(&mut f, &raw).await?;
-        f.sync_all().await?;
         drop(f);
 
         match std::fs::rename(&tmp, meta_path) {
@@ -199,12 +203,6 @@ impl CacheMetaDisk {
             }
         }
     }
-
-    /// Load from `path`. Returns `None` if file does not exist.
-    pub(crate) async fn load_from_path(path: &Path) -> Result<Self> {
-        let raw = tokio::fs::read(path).await?;
-        Self::from_bytes(&raw)
-    }
 }
 
 /// Return a timestamp, represent the nano seconds elapsed from UNIX_EPOCH
@@ -213,22 +211,6 @@ pub(crate) fn now_unix_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
-}
-
-/// Similar to fsync
-pub(crate) async fn fsync<F: AsFd>(f: F) -> Result<()> {
-    let fd = f.as_fd().as_raw_fd();
-    tokio::task::spawn_blocking(move || {
-        let ret = unsafe { libc::fsync(fd) };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(Errno::last())
-        }
-    })
-    .await
-    .context("join tokio spawn_blocking task during fsync failed")?
-    .context("fsync failed")
 }
 
 #[cfg(test)]
