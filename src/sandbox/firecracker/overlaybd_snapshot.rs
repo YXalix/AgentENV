@@ -31,7 +31,8 @@ use super::sandbox::managed_snapshot_base;
 use crate::cfg::ConfigManager;
 use crate::sandbox::ublk::UblkDevice;
 use crate::sandbox::ublk::{
-    compact_layers, create_commit_args, OverlaybdCompactOutput, UblkDeviceManager,
+    compact_layers, create_commit_args, writeback_commit_file, OverlaybdCompactOutput,
+    UblkDeviceManager,
 };
 use crate::sandbox::SandboxCaptureError;
 
@@ -677,6 +678,7 @@ async fn publish_memory_overlaybd_layer(
                     output_path.display()
                 )
             })?;
+        writeback_commit_file(output_path).await;
         Ok(())
     }
     .await;

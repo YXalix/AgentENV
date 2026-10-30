@@ -8,7 +8,7 @@ use overlaybd::index_file::{merge_files_ro, CommitArgs};
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::device::UblkDevice;
@@ -116,6 +116,56 @@ pub(crate) struct OverlaybdRuntimeHandle {
     pub(crate) actual_virtual_size: u64,
 }
 
+/// Kick writeback for a fully written commit file, keeping its page cache
+/// resident, best-effort.
+///
+/// An immediately following resume reads the commit files back, so the pages
+/// are deliberately kept cached. Only the writeback is started now —
+/// `sync_file_range(SYNC_FILE_RANGE_WRITE)` is non-blocking — so the dirty
+/// pool drains per file instead of piling up until the global writeback
+/// threshold throttles every writer. Writeback completion is not awaited,
+/// matching the durability of an unsynced file. Failures only downgrade the
+/// hint and are logged; they never fail the surrounding capture.
+pub(crate) async fn writeback_commit_file(path: &Path) {
+    let blocking_path = path.to_path_buf();
+    let outcome = tokio::task::spawn_blocking(move || writeback_file_blocking(&blocking_path))
+        .await
+        .unwrap_or_else(|error| Err(std::io::Error::other(error)));
+    match outcome {
+        Ok(size) => debug!(
+            path = %path.display(),
+            size_bytes = size,
+            "kicked commit file writeback"
+        ),
+        Err(error) => warn!(
+            path = %path.display(),
+            %error,
+            "failed to kick commit file writeback"
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn writeback_file_blocking(path: &Path) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+
+    let file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    // A zero length means "through end of file". WRITE only starts the flush;
+    // pages stay cached once clean.
+    // SAFETY: `sync_file_range` only reads its scalar arguments.
+    let ret = unsafe { libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(size)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn writeback_file_blocking(_path: &Path) -> std::io::Result<u64> {
+    Ok(0)
+}
+
 /// Compact multiple overlaybd layers into one sealed commit at `output_path`.
 ///
 /// Each input layer is opened through the tar adaptor + switch file chain so
@@ -174,6 +224,8 @@ pub(crate) async fn compact_layers(
         let _ = tokio::fs::remove_file(&lower_tmp).await;
     }
     build_result?;
+
+    writeback_commit_file(output_path).await;
 
     debug!(
         output = %output_path.display(),
@@ -430,6 +482,74 @@ mod tests {
                 algorithm: OverlaybdCompressionAlgorithm::Zstd,
                 workers: OverlaybdCompactOutput::MAX_COMPRESSION_WORKERS,
             }
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writeback_file_blocking_keeps_pages_resident() {
+        use std::os::fd::AsRawFd;
+
+        use nix::sys::statfs::{statfs, TMPFS_MAGIC};
+
+        // Only run the residency assertions on a disk-backed filesystem;
+        // tmpfs pages are the storage itself and always report resident.
+        let disk_backed = [
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            std::env::temp_dir(),
+        ]
+        .into_iter()
+        .find(|dir| {
+            statfs(dir)
+                .map(|mounted| mounted.filesystem_type() != TMPFS_MAGIC)
+                .unwrap_or(false)
+        });
+        let Some(dir) = disk_backed else {
+            return;
+        };
+        let temp = tempfile::tempdir_in(dir).expect("tempdir");
+        let path = temp.path().join("written-back.commit");
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let page_count = 8;
+        let len = page_count * page_size;
+        std::fs::write(&path, vec![0x5Au8; len]).expect("write commit file");
+
+        let file = std::fs::File::open(&path).expect("open commit file");
+        let resident_pages = |file: &std::fs::File| -> usize {
+            let map = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(map, libc::MAP_FAILED);
+            let mut residency = vec![0u8; page_count];
+            assert_eq!(
+                unsafe { libc::mincore(map, len, residency.as_mut_ptr()) },
+                0
+            );
+            unsafe { libc::munmap(map, len) };
+            residency.iter().filter(|flags| *flags & 1 != 0).count()
+        };
+
+        // Populate the page cache and confirm every page is resident first.
+        std::fs::read(&path).expect("read commit file into page cache");
+        assert_eq!(
+            resident_pages(&file),
+            page_count,
+            "pages should be resident before the writeback kick"
+        );
+
+        let size = super::writeback_file_blocking(&path).expect("kick commit file writeback");
+        assert_eq!(size, len as u64);
+        assert_eq!(
+            resident_pages(&file),
+            page_count,
+            "pages should stay resident after the writeback kick"
         );
     }
 }
