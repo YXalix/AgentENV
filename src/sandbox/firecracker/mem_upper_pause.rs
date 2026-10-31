@@ -307,6 +307,22 @@ async fn migrate_stable_images(
         .with_context(|| format!("parse legacy mem image {}", legacy_config.display()))?;
     overlaybd::config::resolve_image_config_local_paths(legacy_config, &mut config);
     let legacy_dir = stable_root.join("legacy");
+    // Migration owns the stable root from scratch: the launching state has no
+    // mem_upper, so anything already sitting here belongs to a foreign
+    // lifecycle (a re-run test, an interrupted pause). Layer files carry
+    // deterministic names (`overlaybd.commit`), so reusing a stale root would
+    // silently splice this pause's dirty pages over another lifecycle's
+    // memory. Reset the root before hardlinking.
+    if mem_upper_path.exists() {
+        tokio::fs::remove_file(mem_upper_path)
+            .await
+            .with_context(|| format!("remove stale {}", mem_upper_path.display()))?;
+    }
+    if legacy_dir.exists() {
+        tokio::fs::remove_dir_all(&legacy_dir)
+            .await
+            .with_context(|| format!("remove stale {}", legacy_dir.display()))?;
+    }
     tokio::fs::create_dir_all(&legacy_dir)
         .await
         .with_context(|| format!("create {}", legacy_dir.display()))?;
@@ -323,6 +339,19 @@ async fn migrate_stable_images(
         match std::fs::hard_link(&source, &target) {
             Ok(()) => layer.file = target.display().to_string(),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Only adopt a pre-existing target when it is the very inode
+                // we know (a same-run retry); a foreign file that happens to
+                // carry the deterministic name must not be adopted silently.
+                use std::os::unix::fs::MetadataExt;
+                let same_inode = match (std::fs::metadata(&source), std::fs::metadata(&target)) {
+                    (Ok(src), Ok(dst)) => src.dev() == dst.dev() && src.ino() == dst.ino(),
+                    _ => false,
+                };
+                ensure!(
+                    same_inode,
+                    "stable legacy layer {} already exists as a foreign inode; refusing to adopt",
+                    target.display()
+                );
                 layer.file = target.display().to_string();
             }
             Err(err) => {
@@ -443,4 +472,75 @@ pub(crate) async fn collapse_varlen_mem(
     )
     .await?;
     Ok(data_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_legacy_config(dir: &Path, payload: &[u8]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let layer = dir.join("overlaybd.commit");
+        std::fs::write(&layer, payload).unwrap();
+        let config_path = dir.join("mem_image.json");
+        std::fs::write(
+            &config_path,
+            format!(r#"{{"lowers":[{{"file":"{}"}}]}}"#, layer.display()),
+        )
+        .unwrap();
+        config_path
+    }
+
+    /// A re-run migration into a stale stable root must reset it: layer files
+    /// carry deterministic names, so adopting a foreign same-named hardlink
+    /// (or a leftover `mem.upper`) would splice this pause's dirty pages over
+    /// another lifecycle's memory.
+    #[tokio::test]
+    async fn migration_resets_stale_stable_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = write_legacy_config(&tmp.path().join("src-first"), b"first-run-bytes");
+        let stable_root = tmp.path().join("stable");
+        let mem_upper = stable_root.join("mem.upper");
+        let stable_image = stable_root.join("image.json");
+        let stable_lowers = stable_root.join("lowers.json");
+
+        migrate_stable_images(
+            &first,
+            &stable_root,
+            &mem_upper,
+            &stable_image,
+            &stable_lowers,
+        )
+        .await
+        .unwrap();
+        let adopted = stable_root.join("legacy").join("0000-overlaybd.commit");
+        assert!(adopted.exists());
+
+        // Foreign leftovers from the first lifecycle.
+        std::fs::write(&mem_upper, b"stale").unwrap();
+        // Re-run: same layer filename, new inode and content.
+        let second = write_legacy_config(&tmp.path().join("src-second"), b"second-run-bytes");
+        migrate_stable_images(
+            &second,
+            &stable_root,
+            &mem_upper,
+            &stable_image,
+            &stable_lowers,
+        )
+        .await
+        .unwrap();
+
+        assert!(!mem_upper.exists(), "stale mem.upper must be removed");
+        assert_eq!(
+            std::fs::read(&adopted).unwrap(),
+            b"second-run-bytes",
+            "legacy target must carry this run's layer, not the foreign one"
+        );
+        let image: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&stable_image).unwrap()).unwrap();
+        assert!(image.get("memUpper").is_some());
+        let lowers: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&stable_lowers).unwrap()).unwrap();
+        assert!(lowers.get("memUpper").is_none());
+    }
 }
