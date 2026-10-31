@@ -227,11 +227,67 @@ pub(crate) async fn harvest_varlen_memory(
         epoch
     };
 
+    if parity_enabled() {
+        if let Err(err) = verify_dirty_parity(&service, &stable_image, &reader, &dirty).await {
+            warn!(?err, "mem.upper parity check could not run");
+        }
+    }
+
     Ok(VarlenPause::Harvested(VarlenPauseOutcome {
         mem_upper_path,
         stable_image_config: stable_image,
         epoch,
     }))
+}
+
+/// Debug gate for the design §6 on-air check ("splice 产物 vs 整块 readv 产物
+/// 全量字节对拍"): after every varlen harvest, re-read each dirty page through
+/// the freshly committed composite and compare against the frozen guest RAM.
+/// Opt-in via `AGENTENV_DEBUG_MEM_UPPER_PARITY`; adds pause latency, so it is
+/// diagnostic tooling, not a production path.
+fn parity_enabled() -> bool {
+    std::env::var("AGENTENV_DEBUG_MEM_UPPER_PARITY").is_ok()
+}
+
+async fn verify_dirty_parity(
+    service: &ImageService,
+    stable_image: &Path,
+    reader: &ProcessVmReader,
+    dirty: &[DirtyPage],
+) -> Result<()> {
+    use tracing::error;
+    let composite = open_varlen_composite_from_config(service, stable_image)
+        .await
+        .context("open composite for dirty parity check")?;
+    let mut expected = vec![0u8; 4096];
+    let mut actual = vec![0u8; 4096];
+    let mut mismatches = Vec::new();
+    for page in dirty {
+        reader.read_exact_remote(page.host_addr, &mut expected)?;
+        let bytes = composite
+            .read_at(page.logical_offset, 4096)
+            .await
+            .with_context(|| format!("parity read at {}", page.logical_offset))?;
+        ensure!(bytes.len() == 4096, "parity short read");
+        actual.copy_from_slice(&bytes);
+        if expected != actual {
+            mismatches.push(page.logical_offset);
+        }
+    }
+    if mismatches.is_empty() {
+        tracing::info!(
+            pages = dirty.len(),
+            "mem.upper dirty parity OK (composite == frozen guest RAM)"
+        );
+    } else {
+        error!(
+            mismatched_pages = mismatches.len(),
+            checked = dirty.len(),
+            first = ?mismatches.iter().take(8).collect::<Vec<_>>(),
+            "mem.upper DIRTY PARITY FAILED: composite disagrees with frozen guest RAM"
+        );
+    }
+    Ok(())
 }
 
 /// Full re-harvest into `mem.upper.new` over the old composite, then rename
