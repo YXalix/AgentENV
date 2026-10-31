@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Context;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::cfg::ConfigManager;
 use crate::image::cache::{
@@ -1435,6 +1435,26 @@ where
     }
 
     async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        // D2-A second fence: a lingering record means the previous resume's
+        // delete failed. The sandbox is Running, so the record is stale;
+        // block the harvest until it is cleaned (fail the pause otherwise)
+        // so no new record can race the orphaned one.
+        match self.persister.record_exists(&sandbox_id).await {
+            Ok(true) => {
+                error!(%sandbox_id, "stale paused record found before pause; deleting it before harvesting");
+                if let Err(err) = self.persister.delete_record(&sandbox_id).await {
+                    error!(error = ?err, %sandbox_id, "failed to delete stale paused record; blocking pause");
+                    return Err(OrchestratorError::InternalError(format!(
+                        "stale paused record for {sandbox_id} could not be deleted: {err:#}"
+                    )));
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(error = ?err, %sandbox_id, "failed to check for stale paused record");
+            }
+        }
+
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
             let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
@@ -2557,7 +2577,9 @@ where
 
         if matches!(plan, LaunchPlan::Resume(_)) {
             if let Err(err) = self.persister.delete_record(&sandbox_id).await {
-                warn!(error = %format_args!("{err:#}"), "failed to delete persisted sandbox record after resume");
+                // Escalated to error (I-8): the next pause of this sandbox
+                // will block on the stale record until it is deleted.
+                error!(error = %format_args!("{err:#}"), "failed to delete persisted sandbox record after resume");
             }
         }
 

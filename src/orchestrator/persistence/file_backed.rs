@@ -16,7 +16,14 @@ use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
-const RECORD_VERSION: u32 = 1;
+/// Records written by this binary. Version 2 adds the varlen pause state
+/// (`mem_upper_path`/`mem_upper_epoch` inside the encoded snapshot config);
+/// older binaries reject v2 records outright, which is the deliberate
+/// rollback fence (design I-10): a downgraded binary discards varlen paused
+/// sandboxes instead of resuming torn generations.
+const RECORD_VERSION: u32 = 2;
+/// Record versions this binary can decode.
+const SUPPORTED_RECORD_VERSIONS: &[u32] = &[1, 2];
 const RECORD_DB_DIR: &str = "records.db";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -73,7 +80,7 @@ fn decode_record(bytes: &[u8]) -> PersistenceResult<PersistedPausedRecord> {
 }
 
 fn ensure_supported_version(version: u32) -> PersistenceResult<()> {
-    if version == RECORD_VERSION {
+    if SUPPORTED_RECORD_VERSIONS.contains(&version) {
         Ok(())
     } else {
         Err(SandboxPersistenceError::InvalidRecord {
@@ -140,9 +147,8 @@ impl FileBackedSandboxPersister {
             .get(sandbox_id.to_string())
             .await
             .map_err(|source| SandboxPersistenceError::store("read paused sandbox record", source))?
-            .ok_or_else(|| SandboxPersistenceError::InvalidRecord {
-                reason: format!("paused sandbox record {sandbox_id} not found"),
-                source: None,
+            .ok_or_else(|| SandboxPersistenceError::RecordNotFound {
+                sandbox_id: sandbox_id.to_string(),
             })?;
         decode_record(&bytes)
     }
@@ -314,6 +320,14 @@ impl SandboxPersister for FileBackedSandboxPersister {
         );
 
         Ok(sandboxes)
+    }
+
+    async fn record_exists(&self, sandbox_id: &SandboxId) -> PersistenceResult<bool> {
+        match self.get_record(sandbox_id).await {
+            Ok(_) => Ok(true),
+            Err(SandboxPersistenceError::RecordNotFound { .. }) => Ok(false),
+            Err(source) => Err(source),
+        }
     }
 
     async fn allocate_artifact_root(

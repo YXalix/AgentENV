@@ -30,6 +30,8 @@ pub enum SandboxPersistenceError {
         #[source]
         source: Option<anyhow::Error>,
     },
+    #[error("paused sandbox record {sandbox_id} not found")]
+    RecordNotFound { sandbox_id: String },
     #[error("invalid paused sandbox runtime state: {reason}")]
     RuntimeState { reason: &'static str },
     #[error("paused sandbox store operation failed: {operation}: {source}")]
@@ -89,6 +91,11 @@ pub trait SandboxPersister: Send + Sync {
     /// Roll back a resuming mark after a failed resume attempt.
     async fn rollback_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 
+    /// Whether a paused record still exists for a sandbox. Storm pauses use
+    /// this to block harvesting while a stale record (a resume whose record
+    /// delete failed) lingers (design D2-A).
+    async fn record_exists(&self, sandbox_id: &SandboxId) -> PersistenceResult<bool>;
+
     /// Delete the persistence record for a sandbox.
     async fn delete_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 
@@ -130,6 +137,10 @@ impl SandboxPersister for DisabledSandboxPersister {
 
     async fn rollback_resuming(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
         Ok(())
+    }
+
+    async fn record_exists(&self, _sandbox_id: &SandboxId) -> PersistenceResult<bool> {
+        Ok(false)
     }
 
     async fn delete_record(&self, _sandbox_id: &SandboxId) -> PersistenceResult<()> {
