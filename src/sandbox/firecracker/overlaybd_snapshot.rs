@@ -276,7 +276,15 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8], description: &str) -> Resul
             path.display()
         ))
     })?;
+    sync_parent_directory(parent)?;
     Ok(())
+}
+
+/// Flushes a directory entry so a renamed file survives a host crash.
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("sync parent directory {}", parent.display()))
 }
 
 async fn copy_file_atomically(src: &Path, dst: &Path, description: &str) -> Result<()> {
