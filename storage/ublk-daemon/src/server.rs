@@ -12,6 +12,7 @@ use overlaybd::config::{ImageConfig, UpperConfig, UpperMode};
 use overlaybd::helper::prepare_runtime_upper;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
+use overlaybd::mem_upper::MemUpperGeneration;
 use overlaybd::RestackSnapshotTerminalFailure;
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
@@ -75,6 +76,10 @@ struct ActiveShared {
     image_config: PathBuf,
     image: Arc<ImageFile>,
     refcount: usize,
+    /// Content stamp at insert time (see [`shared_content_stamp`]). Varlen
+    /// memory composites are the only shared images whose backing file is
+    /// rewritten in place, so reuse must verify the stamp still matches.
+    mem_upper_epoch: Option<MemUpperGeneration>,
 }
 
 /// Canonical key for shared-mode devices: (image_config, global_config).
@@ -1573,6 +1578,79 @@ async fn acquire_exclusive(
     })
 }
 
+/// Content stamp for shared-device reuse. Varlen memory composites are the
+/// only shared images whose backing file is rewritten in place (`mem.upper`
+/// commits a new epoch on every harvest); every other shared image is
+/// immutable, so `None` always reuses.
+fn shared_content_stamp(image_config: &Path) -> Result<Option<MemUpperGeneration>> {
+    let raw = std::fs::read_to_string(image_config)
+        .with_context(|| format!("read image config {}", image_config.display()))?;
+    let mut config: ImageConfig = serde_json::from_str(&raw)
+        .with_context(|| format!("parse image config {}", image_config.display()))?;
+    overlaybd::config::resolve_image_config_local_paths(image_config, &mut config);
+    match &config.mem_upper {
+        Some(mem_upper) => Ok(Some(
+            MemUpperGeneration::current(Path::new(&mem_upper.file))
+                .with_context(|| format!("read mem.upper epoch of {}", mem_upper.file))?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// What to do with a cached shared device at acquire time.
+#[derive(Debug, PartialEq, Eq)]
+enum SharedReuseDecision {
+    /// Cached stamp matches; the device serves the requested content.
+    Reuse,
+    /// Cached stamp is stale. With at most one (dead or leaked) holder the
+    /// device is discarded and rebuilt from the current file.
+    ReplaceStale,
+    /// Stamp advanced while live users hold the device — an ownership
+    /// violation; refuse instead of serving stale memory or evicting the
+    /// running readers.
+    Reject,
+}
+
+fn shared_reuse_decision(
+    cached: Option<MemUpperGeneration>,
+    fresh: Option<MemUpperGeneration>,
+    refcount: usize,
+) -> SharedReuseDecision {
+    if cached == fresh {
+        SharedReuseDecision::Reuse
+    } else if refcount <= 1 {
+        SharedReuseDecision::ReplaceStale
+    } else {
+        SharedReuseDecision::Reject
+    }
+}
+
+/// Drops a stale shared entry, idling its device back to the pool. The
+/// removal is identity-checked so a racing re-insert is never discarded.
+async fn evict_stale_shared(
+    pool: &Arc<PoolState>,
+    ctrl_ring: &IoRingHandle<io_uring::squeue::Entry128>,
+    key: &SharedKey,
+    expected_dev_id: u32,
+) -> Result<()> {
+    if let Some((_, active)) = pool.active_shared.remove(key) {
+        if active.dev.dev_id() != expected_dev_id {
+            // The stale entry was already replaced by a racing acquire; keep
+            // the fresh one and let the caller proceed against it.
+            pool.active_shared.insert(key.clone(), active);
+            return Ok(());
+        }
+        pool.shared_by_dev_id.remove(&expected_dev_id);
+        tracing::warn!(
+            dev_id = expected_dev_id,
+            image_config = %active.image_config.display(),
+            "evicting stale shared device (mem.upper advanced while cached)"
+        );
+        release_shared_device(pool, ctrl_ring.clone(), expected_dev_id, active).await?;
+    }
+    Ok(())
+}
+
 async fn acquire_shared(
     pool: Arc<PoolState>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
@@ -1581,21 +1659,44 @@ async fn acquire_shared(
     image: Arc<ImageFile>,
 ) -> Result<DaemonResponse> {
     let key = (image_config.to_path_buf(), global_config.to_path_buf());
+    let stamp = shared_content_stamp(image_config)
+        .with_context(|| format!("stamp shared image content {}", image_config.display()))?;
 
     // Check if already active.
     if let Some(mut entry) = pool.active_shared.get_mut(&key) {
-        entry.refcount += 1;
-        let dev_id = entry.dev.dev_id();
-        let device_path = entry.dev.device_path().to_path_buf();
-        tracing::info!(
-            dev_id,
-            refcount = entry.refcount,
-            "reusing shared overlaybd device"
-        );
-        return Ok(DaemonResponse::DeviceAcquired {
-            dev_id,
-            device_path,
-        });
+        match shared_reuse_decision(entry.mem_upper_epoch, stamp, entry.refcount) {
+            SharedReuseDecision::Reuse => {
+                entry.refcount += 1;
+                let dev_id = entry.dev.dev_id();
+                let device_path = entry.dev.device_path().to_path_buf();
+                tracing::info!(
+                    dev_id,
+                    refcount = entry.refcount,
+                    "reusing shared overlaybd device"
+                );
+                return Ok(DaemonResponse::DeviceAcquired {
+                    dev_id,
+                    device_path,
+                });
+            }
+            SharedReuseDecision::ReplaceStale => {
+                let stale_dev_id = entry.dev.dev_id();
+                drop(entry);
+                evict_stale_shared(&pool, &ctrl_ring, &key, stale_dev_id).await?;
+                // Fall through and build a device for the current file.
+            }
+            SharedReuseDecision::Reject => {
+                let cached = entry.mem_upper_epoch;
+                let refcount = entry.refcount;
+                drop(entry);
+                bail!(
+                    "shared overlaybd image {} advanced (mem.upper epoch \
+                     {cached:?} -> {stamp:?}) while {refcount} users still hold \
+                     its device; refusing to serve stale memory",
+                    image_config.display()
+                );
+            }
+        }
     }
 
     let (dev, is_reused) =
@@ -1617,24 +1718,41 @@ async fn acquire_shared(
     match pool.active_shared.entry(key.clone()) {
         Entry::Occupied(mut entry) => {
             let active = entry.get_mut();
-            active.refcount += 1;
-            let existing_dev_id = active.dev.dev_id();
-            let existing_path = active.dev.device_path().to_path_buf();
-            let refcount = active.refcount;
-            drop(entry);
+            match shared_reuse_decision(active.mem_upper_epoch, stamp, active.refcount) {
+                SharedReuseDecision::Reuse => {
+                    active.refcount += 1;
+                    let existing_dev_id = active.dev.dev_id();
+                    let existing_path = active.dev.device_path().to_path_buf();
+                    let refcount = active.refcount;
+                    drop(entry);
 
-            // Do not idle a redundant business-image device.
-            drop(image);
-            stop_overlaybd_device(ctrl_ring, dev).await;
-            tracing::info!(
-                dev_id = existing_dev_id,
-                refcount,
-                "concurrent shared overlaybd acquire reused existing device"
-            );
-            return Ok(DaemonResponse::DeviceAcquired {
-                dev_id: existing_dev_id,
-                device_path: existing_path,
-            });
+                    // Do not idle a redundant business-image device.
+                    drop(image);
+                    stop_overlaybd_device(ctrl_ring, dev).await;
+                    tracing::info!(
+                        dev_id = existing_dev_id,
+                        refcount,
+                        "concurrent shared overlaybd acquire reused existing device"
+                    );
+                    return Ok(DaemonResponse::DeviceAcquired {
+                        dev_id: existing_dev_id,
+                        device_path: existing_path,
+                    });
+                }
+                // The stamp moved under us between the early check and this
+                // insert. The next acquire's early check evicts the stale
+                // entry; do not hand out either device now.
+                SharedReuseDecision::ReplaceStale | SharedReuseDecision::Reject => {
+                    drop(entry);
+                    stop_overlaybd_device(ctrl_ring, dev).await;
+                    bail!(
+                        "shared overlaybd image {} changed while acquiring \
+                         (mem.upper epoch {:?} != {stamp:?}); retry the acquire",
+                        image_config.display(),
+                        pool.active_shared.get(&key).and_then(|e| e.mem_upper_epoch),
+                    );
+                }
+            }
         }
         Entry::Vacant(entry) => {
             pool.shared_by_dev_id.insert(dev_id, key);
@@ -1643,6 +1761,7 @@ async fn acquire_shared(
                 image_config: image_config.to_path_buf(),
                 image,
                 refcount: 1,
+                mem_upper_epoch: stamp,
             });
         }
     }
@@ -2095,6 +2214,67 @@ fn clear_page_cache(device_path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn shared_reuse_decision_matches_stamp_and_refcount() {
+        use overlaybd::mem_upper::MemUpperGeneration as Gen;
+        use SharedReuseDecision::*;
+        // Immutable images and matching varlen epochs always reuse.
+        assert_eq!(shared_reuse_decision(None, None, 3), Reuse);
+        assert_eq!(shared_reuse_decision(Some(Gen(4)), Some(Gen(4)), 2), Reuse);
+        // A stale stamp with at most one (dead or leaked) holder is replaced.
+        assert_eq!(
+            shared_reuse_decision(Some(Gen(4)), Some(Gen(5)), 1),
+            ReplaceStale
+        );
+        assert_eq!(
+            shared_reuse_decision(Some(Gen(4)), Some(Gen(5)), 0),
+            ReplaceStale
+        );
+        assert_eq!(shared_reuse_decision(Some(Gen(4)), None, 1), ReplaceStale);
+        // Live users on a stale device must not be evicted silently.
+        assert_eq!(shared_reuse_decision(Some(Gen(4)), Some(Gen(5)), 2), Reject);
+    }
+
+    #[test]
+    fn shared_content_stamp_tracks_mem_upper_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Immutable config: no stamp, reuse stays unconditional.
+        let plain = dir.path().join("plain.json");
+        std::fs::write(&plain, r#"{"lowers":[]}"#).unwrap();
+        assert_eq!(shared_content_stamp(&plain).unwrap(), None);
+
+        // Varlen config: stamp mirrors the file header epoch.
+        let mem_upper = dir.path().join("mem.upper");
+        overlaybd::mem_upper::MemUpperWriter::create(&mem_upper, 1024 * 1024).unwrap();
+        let varlen = dir.path().join("varlen.json");
+        std::fs::write(
+            &varlen,
+            serde_json::json!({
+                "lowers": [],
+                "memUpper": {"file": mem_upper.display().to_string()},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            shared_content_stamp(&varlen).unwrap(),
+            Some(MemUpperGeneration(0))
+        );
+
+        // Every harvest commit bumps the stamp, so a cached device from the
+        // previous generation stops being reusable.
+        let mut writer =
+            overlaybd::mem_upper::MemUpperWriter::open(&mem_upper, 1024 * 1024).unwrap();
+        let epoch = writer.commit().unwrap();
+        assert_eq!(epoch, 1);
+        assert_eq!(
+            shared_content_stamp(&varlen).unwrap(),
+            Some(MemUpperGeneration(epoch))
+        );
+    }
 
     #[test]
     fn clear_page_cache_reports_open_failure() {
@@ -2119,7 +2299,6 @@ mod tests {
         // block device, so BLKFLSBUF fails — still an error, never silent.
         assert!(clear_page_cache_injectable(Path::new("/dev/null")).is_err());
     }
-    use tempfile::TempDir;
 
     /// Minimal local `ImageService`; placeholder images have no lowers, so this
     /// is never used for registry access.
