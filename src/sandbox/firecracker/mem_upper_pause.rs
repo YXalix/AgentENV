@@ -681,4 +681,422 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&stable_lowers).unwrap()).unwrap();
         assert!(lowers.get("memUpper").is_none());
     }
+
+    // ── In-process byte-parity harness ─────────────────────────────────
+    //
+    // `snapshot_chain_survives_after_parent_snapshot_handle_is_dropped`
+    // (integration) times out on the first varlen resume: the guest keeps
+    // running while envd never answers, i.e. the composite serves wrong
+    // bytes without failing. This harness reproduces the whole content path
+    // without a VM: a real multi-layer legacy mem stack ([base, D1, D2]
+    // built with the production layer publisher), a synthetic guest RAM
+    // advanced by per-page dirty deltas, the real migration + harvest code
+    // reading that RAM through `ProcessVmReader` on this very process, and
+    // the daemon-identical composite open (`open_varlen_composite_from_config`)
+    // whose every byte must equal the final RAM image.
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use firecracker_client::models::DirtyMemoryRange;
+    use overlaybd::config::GlobalConfig;
+    use overlaybd::index::{Segment, SegmentMapping};
+
+    use crate::sandbox::firecracker::overlaybd_snapshot::publish_memory_overlaybd_layer;
+    use crate::sandbox::ublk::OverlaybdCompactOutput;
+
+    const HARNESS_MEM_SPEC: u64 = 8 * 1024 * 1024;
+    const HARNESS_PAGE: u64 = 4096;
+    const HARVEST_CONCURRENCY: usize = 8;
+
+    fn next_u64(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn fill_pattern(buf: &mut [u8], seed: u64) {
+        let mut state = seed.max(1);
+        for chunk in buf.chunks_mut(8) {
+            let word = next_u64(&mut state).to_le_bytes();
+            chunk.copy_from_slice(&word[..chunk.len()]);
+        }
+    }
+
+    /// Immutable `VirtualFile` over a pre-built RAM image.
+    struct RamFile(Arc<Vec<u8>>);
+
+    #[async_trait]
+    impl VirtualFile for RamFile {
+        async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
+            let begin = offset as usize;
+            ensure!(
+                begin
+                    .checked_add(len)
+                    .is_some_and(|end| end <= self.0.len()),
+                "RamFile read [{offset}, +{len}) beyond {}",
+                self.0.len()
+            );
+            Ok(Bytes::copy_from_slice(&self.0[begin..begin + len]))
+        }
+
+        async fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("RamFile is read-only")
+        }
+
+        async fn size(&self) -> Result<u64> {
+            Ok(self.0.len() as u64)
+        }
+    }
+
+    fn ram_file(bytes: &[u8]) -> Arc<dyn VirtualFile> {
+        Arc::new(RamFile(Arc::new(bytes.to_vec())))
+    }
+
+    /// A 4K-aligned window inside a heap allocation standing in for
+    /// Firecracker's guest-RAM mapping; `dirty_pages()` requires the host
+    /// base to be page aligned. The storage never moves after construction.
+    struct HostRam {
+        storage: Vec<u8>,
+        pad: usize,
+    }
+
+    impl HostRam {
+        fn new(bytes: &[u8]) -> Self {
+            let mut storage = vec![0u8; bytes.len() + HARNESS_PAGE as usize];
+            let misalign = storage.as_ptr() as u64 % HARNESS_PAGE;
+            let pad = ((HARNESS_PAGE - misalign) % HARNESS_PAGE) as usize;
+            storage[pad..pad + bytes.len()].copy_from_slice(bytes);
+            Self { storage, pad }
+        }
+
+        fn base(&self) -> u64 {
+            self.storage[self.pad..].as_ptr() as u64
+        }
+    }
+
+    /// Dirty-page set as Firecracker would report it: contiguous pages
+    /// merged into ranges, host addresses affine to the image offsets.
+    fn dirty_ranges_for(base: u64, dirty_pages: &[u64]) -> DirtyMemoryRanges {
+        let mut pages = dirty_pages.to_vec();
+        pages.sort_unstable();
+        pages.dedup();
+        let mut ranges: Vec<DirtyMemoryRange> = Vec::new();
+        for page in pages {
+            let offset = page * HARNESS_PAGE;
+            match ranges.last_mut() {
+                Some(last) if last.image_offset + last.length == offset as i64 => {
+                    last.length += HARNESS_PAGE as i64;
+                }
+                _ => ranges.push(DirtyMemoryRange {
+                    base_host_virt_addr: (base + offset) as i64,
+                    image_offset: offset as i64,
+                    length: HARNESS_PAGE as i64,
+                }),
+            }
+        }
+        DirtyMemoryRanges {
+            page_size: HARNESS_PAGE as i32,
+            memory_size: HARNESS_MEM_SPEC as i64,
+            ranges,
+        }
+    }
+
+    /// Pages → identity mappings into a full-RAM source file (the shape
+    /// `dirty_ranges_to_segment_mappings` produces for legacy pauses).
+    fn page_runs_to_mappings(pages: &[u64]) -> Vec<SegmentMapping> {
+        let mut pages = pages.to_vec();
+        pages.sort_unstable();
+        pages.dedup();
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for page in pages {
+            let start = page * (HARNESS_PAGE / 512);
+            match runs.last_mut() {
+                Some(last) if last.0 + last.1 == start => last.1 += HARNESS_PAGE / 512,
+                _ => runs.push((start, HARNESS_PAGE / 512)),
+            }
+        }
+        let mut mappings = Vec::new();
+        for (start, mut len) in runs {
+            let mut at = start;
+            while len > 0 {
+                let chunk = len.min(u64::from(Segment::MAX_LENGTH));
+                mappings.push(SegmentMapping::new(at, chunk as u32, at, false, 0));
+                at += chunk;
+                len -= chunk;
+            }
+        }
+        mappings
+    }
+
+    async fn harness_image_service(tmp: &Path) -> Result<Arc<ImageService>> {
+        let mut cfg = GlobalConfig::default();
+        let cache = tmp.join("overlaybd-cache").display().to_string();
+        cfg.registry_cache_dir = cache.clone();
+        cfg.cache_config.cache_dir = cache;
+        cfg.gzip_cache_config.cache_dir = tmp.join("gzip-cache").display().to_string();
+        cfg.enable_audit = false;
+        cfg.audit_path = tmp.join("audit.log").display().to_string();
+        cfg.log_path = tmp.join("overlaybd.log").display().to_string();
+        Ok(Arc::new(ImageService::new(cfg).await?))
+    }
+
+    async fn publish_layer(
+        source: Arc<dyn VirtualFile>,
+        mappings: &[SegmentMapping],
+        output: &Path,
+    ) -> Result<()> {
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        publish_memory_overlaybd_layer(
+            &[source],
+            mappings,
+            HARNESS_MEM_SPEC,
+            output,
+            OverlaybdCompactOutput::Raw,
+            HARVEST_CONCURRENCY,
+        )
+        .await
+    }
+
+    /// Full-image compare plus boundary-crossing odd windows, all through the
+    /// same `VirtualFile::read_at_into` the daemon's ublk path settles into.
+    async fn assert_composite_serves(
+        composite: &overlaybd::index_file::LSMTReadOnlyFile,
+        expected: &[u8],
+        stage: &str,
+    ) -> Result<()> {
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut offset = 0u64;
+        while offset < expected.len() as u64 {
+            let len = buf.len().min(expected.len() - offset as usize);
+            let n = composite
+                .read_at_into(offset, &mut buf[..len])
+                .await
+                .with_context(|| format!("{stage} read at {offset}"))?;
+            ensure!(n == len, "{stage} short read at {offset}: {n} != {len}");
+            let window = &expected[offset as usize..offset as usize + len];
+            if buf[..len] != window[..] {
+                let first = buf[..len]
+                    .iter()
+                    .zip(window.iter())
+                    .position(|(got, want)| got != want)
+                    .expect("lengths equal, at least one byte differs");
+                let at = offset as usize + first;
+                anyhow::bail!(
+                    "{stage} bytes differ at offset {at} (page {}): got {:02x?}.. want {:02x?}..",
+                    at / 4096,
+                    &buf[first..(first + 8).min(len)],
+                    &expected[at..(at + 8).min(expected.len())],
+                );
+            }
+            offset += len as u64;
+        }
+        // Odd windows that straddle 16K block edges and mem.upper payloads.
+        for (start, len) in [
+            (0usize, 4096usize),
+            (16 * 1024 - 512, 1024),
+            (32 * 1024 + 512, 8 * 1024 - 512),
+            (48 * 1024, 4096),
+            (64 * 1024 - 512, 1024),
+        ] {
+            let mut odd = vec![0u8; len];
+            let n = composite.read_at_into(start as u64, &mut odd).await?;
+            ensure!(n == len, "composite short odd read at {start}");
+            ensure!(
+                odd == expected[start..start + len],
+                "composite odd window [{start}, +{len}) differs"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn varlen_migration_and_steady_harvest_serve_exact_ram_bytes() -> Result<()> {
+        let tmp = tempfile::tempdir().context("tempdir")?;
+        let service = harness_image_service(tmp.path()).await?;
+        let total_pages = HARNESS_MEM_SPEC / HARNESS_PAGE;
+        let mut rng = 0x5EED_0001u64;
+
+        // ── Legacy stack: [base, D1, D2] exactly like two capture pauses ──
+        let mut ram0 = vec![0u8; HARNESS_MEM_SPEC as usize];
+        fill_pattern(&mut ram0, 0xAA11);
+        let base_layer = tmp.path().join("gen0/mem_overlaybd/overlaybd.commit");
+        publish_layer(
+            ram_file(&ram0),
+            &page_runs_to_mappings(&(0..total_pages).collect::<Vec<_>>()),
+            &base_layer,
+        )
+        .await
+        .context("publish base layer")?;
+
+        let pick_pages = |state: &mut u64, count: u64| -> Vec<u64> {
+            let mut set = std::collections::BTreeSet::new();
+            while set.len() < count as usize {
+                set.insert(next_u64(state) % total_pages);
+            }
+            set.into_iter().collect()
+        };
+
+        let dirty1 = pick_pages(&mut rng, total_pages / 4);
+        let mut ram1 = ram0.clone();
+        for &page in &dirty1 {
+            let at = (page * HARNESS_PAGE) as usize;
+            fill_pattern(&mut ram1[at..at + HARNESS_PAGE as usize], 0xC0DE ^ page);
+        }
+        let d1_layer = tmp.path().join("gen1/mem_overlaybd/overlaybd.commit");
+        publish_layer(ram_file(&ram1), &page_runs_to_mappings(&dirty1), &d1_layer)
+            .await
+            .context("publish first dirty layer")?;
+
+        let dirty2 = pick_pages(&mut rng, total_pages / 6);
+        let mut ram2 = ram1.clone();
+        for &page in &dirty2 {
+            let at = (page * HARNESS_PAGE) as usize;
+            fill_pattern(&mut ram2[at..at + HARNESS_PAGE as usize], 0xFEED ^ page);
+        }
+        let d2_layer = tmp.path().join("gen2/mem_overlaybd/overlaybd.commit");
+        publish_layer(ram_file(&ram2), &page_runs_to_mappings(&dirty2), &d2_layer)
+            .await
+            .context("publish second dirty layer")?;
+
+        let legacy_config = tmp.path().join("gen2/mem_image.json");
+        std::fs::write(
+            &legacy_config,
+            serde_json::json!({
+                "lowers": [
+                    {"file": base_layer.display().to_string()},
+                    {"file": d1_layer.display().to_string()},
+                    {"file": d2_layer.display().to_string()},
+                ],
+            })
+            .to_string(),
+        )?;
+
+        // Sanity: the legacy stack resolves to ram2 — what the resumed guest
+        // started from. If this fails the harness layers are wrong, not the
+        // varlen code.
+        let legacy_stack = open_lower_stack_from_config(&service, &legacy_config).await?;
+        assert_composite_serves(&legacy_stack, &ram2, "legacy-stack sanity").await?;
+
+        // ── First varlen pause (migration): dirty3 = full blocks, partial
+        // blocks, template-equal pages, and whole blocks rewritten with
+        // identical bytes ──
+        let mut dirty3 = std::collections::BTreeSet::new();
+        let mut ram3 = ram2.clone();
+        for block in 0..40u64 {
+            for p in 0..4u64 {
+                let page = block * 4 + p + 64;
+                let at = (page * HARNESS_PAGE) as usize;
+                fill_pattern(&mut ram3[at..at + HARNESS_PAGE as usize], 0x1234 ^ page);
+                dirty3.insert(page);
+            }
+        }
+        for page in (256..320u64).step_by(2) {
+            let at = (page * HARNESS_PAGE) as usize;
+            fill_pattern(&mut ram3[at..at + HARNESS_PAGE as usize], 0xBEEF ^ page);
+            dirty3.insert(page);
+        }
+        for page in 512..536u64 {
+            dirty3.insert(page); // dirty-marked but bytes unchanged
+        }
+        for block in 0..8u64 {
+            for p in 0..4u64 {
+                dirty3.insert(600 + block * 4 + p); // identical rewrite
+            }
+        }
+        let dirty3_pages: Vec<u64> = dirty3.into_iter().collect();
+
+        let stable_root = tmp.path().join("stable");
+        let mem_upper = stable_root.join("mem.upper");
+        let stable_image = stable_root.join("image.json");
+        let stable_lowers = stable_root.join("lowers.json");
+        migrate_stable_images(
+            &legacy_config,
+            &stable_root,
+            &mem_upper,
+            &stable_image,
+            &stable_lowers,
+        )
+        .await
+        .context("migrate legacy stack")?;
+
+        let host3 = HostRam::new(&ram3);
+        let (pages3, mem_spec) = dirty_pages(&dirty_ranges_for(host3.base(), &dirty3_pages))?;
+        ensure!(mem_spec == HARNESS_MEM_SPEC, "harness mem_spec");
+        ensure!(
+            pages3.len() == dirty3_pages.len(),
+            "harness dirty page flattening: {} != {}",
+            pages3.len(),
+            dirty3_pages.len()
+        );
+
+        let reader = ProcessVmReader::new(Pid::from_raw(std::process::id() as i32));
+        let mut writer = MemUpperWriter::create(&mem_upper, HARNESS_MEM_SPEC)?;
+        let views = HarvestViews::uniform(Arc::new(
+            open_lower_stack_from_config(&service, &stable_lowers).await?,
+        ) as Arc<dyn VirtualFile>);
+        let stats = writer
+            .harvest(&pages3, &reader, views, &HarvestOptions::default())
+            .await
+            .context("migration harvest")?;
+        let epoch1 = writer.commit()?;
+        assert!(stats.written > 0, "migration harvest must write blocks");
+
+        // Daemon-identical open of the stable config must serve ram3 exactly.
+        let composite = open_varlen_composite_from_config(&service, &stable_image).await?;
+        assert_composite_serves(&composite, &ram3, "migration resume").await?;
+        ensure!(
+            MemUpperGeneration::current(&mem_upper)? == MemUpperGeneration::from(epoch1),
+            "committed epoch must be observable"
+        );
+        drop(composite);
+
+        // ── Steady harvest (cycle 4): re-dirty harvested blocks, revert
+        // some to the lower view (template equality must free payloads), and
+        // touch fresh blocks ──
+        let mut dirty4 = std::collections::BTreeSet::new();
+        let mut ram4 = ram3.clone();
+        for p in 0..4u64 {
+            let page = 64 + p; // re-dirty the first migration block
+            let at = (page * HARNESS_PAGE) as usize;
+            fill_pattern(&mut ram4[at..at + HARNESS_PAGE as usize], 0x9999 ^ page);
+            dirty4.insert(page);
+        }
+        for block in 0..4u64 {
+            for p in 0..4u64 {
+                let page = 256 + block * 4 + p; // revert to the lower bytes
+                let at = (page * HARNESS_PAGE) as usize;
+                ram4[at..at + HARNESS_PAGE as usize]
+                    .copy_from_slice(&ram2[at..at + HARNESS_PAGE as usize]);
+                dirty4.insert(page);
+            }
+        }
+        for page in 1500..1520u64 {
+            let at = (page * HARNESS_PAGE) as usize; // fresh blocks
+            fill_pattern(&mut ram4[at..at + HARNESS_PAGE as usize], 0x7777 ^ page);
+            dirty4.insert(page);
+        }
+        let dirty4_pages: Vec<u64> = dirty4.into_iter().collect();
+
+        // New "Firecracker process" — a fresh host mapping of the same RAM.
+        drop(host3);
+        let host4 = HostRam::new(&ram4);
+        let (pages4, _) = dirty_pages(&dirty_ranges_for(host4.base(), &dirty4_pages))?;
+
+        let mut writer = MemUpperWriter::open(&mem_upper, HARNESS_MEM_SPEC)?;
+        let views = HarvestViews::uniform(Arc::new(
+            open_lower_stack_from_config(&service, &stable_lowers).await?,
+        ) as Arc<dyn VirtualFile>);
+        writer
+            .harvest(&pages4, &reader, views, &HarvestOptions::default())
+            .await
+            .context("steady harvest")?;
+        writer.commit()?;
+
+        let composite = open_varlen_composite_from_config(&service, &stable_image).await?;
+        assert_composite_serves(&composite, &ram4, "steady resume").await?;
+        Ok(())
+    }
 }
