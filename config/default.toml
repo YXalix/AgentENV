@@ -369,9 +369,10 @@ fill_concurrency = 4
 # Generated OverlayBD config dedicated to memory snapshot devices.
 # overlaybd_global_config_path = "$AENV_HOME/overlaybd/mem-overlaybd-global.json"
 
-# EXPERIMENTAL: use Firecracker KVM dirty-page tracking instead of mincore.
-# It is automatically disabled for PVM. Memory snapshot packaging always uses the direct
-# OverlayBD path. Disable with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
+# Firecracker KVM dirty-page tracking. Required for pausing: every
+# memory-persistence path (the varlen harvest and the per-pause layer
+# fallback alike) reads Firecracker dirty ranges. Automatically disabled
+# for PVM. Disable with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
 track_dirty_pages = true
 
 # Compress memory layers as ZFile when pausing instead of leaving them raw.

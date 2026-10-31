@@ -21,7 +21,7 @@ impl ProcessVmReader {
     // worker polling `VirtualFile::read_at_into`. Offloading it without an
     // extra memory copy requires an owned-buffer interface or a dedicated
     // blocking worker that owns the destination buffer for the request.
-    fn read_exact_remote(&self, remote_addr: u64, dst: &mut [u8]) -> Result<()> {
+    pub(super) fn read_exact_remote(&self, remote_addr: u64, dst: &mut [u8]) -> Result<()> {
         if dst.is_empty() {
             return Ok(());
         }

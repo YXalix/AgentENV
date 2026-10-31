@@ -563,7 +563,7 @@ the default path on every startup.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
-| `track_dirty_pages` | bool | `true` | Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false` to disable it. |
+| `track_dirty_pages` | bool | `true` | Enable Firecracker KVM dirty-page tracking for memory snapshots. Required for pausing: every memory-persistence path (the varlen `mem.upper` harvest and the per-pause layer fallback alike) reads Firecracker dirty ranges. PVM automatically disables it because this combination has not been tested. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false` to disable it. |
 | `compression_enabled` | bool | `false` | Compress memory snapshot layers as ZFile when pausing instead of leaving them raw. Disabled by default so local pause/resume pays no decompression cost; the algorithm and worker count come from `[snapshot.publish_compression]`, so pause artifacts stay in the format publish uploads and pass through unchanged. Rootfs layers always stay raw. |
 
 ## `[memory_snapshot.background_download]`

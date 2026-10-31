@@ -35,7 +35,7 @@ pub(crate) use firecracker::record_startup_pack;
 pub use firecracker::{
     FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
-    FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
+    FirecrackerSandboxFactory, FirecrackerSnapshotConfig, PauseMode,
 };
 pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
 pub use metrics::SandboxMetric;

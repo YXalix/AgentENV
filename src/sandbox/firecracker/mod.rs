@@ -9,6 +9,7 @@ mod config;
 mod connector;
 mod factory;
 mod instance;
+mod mem_upper_pause;
 mod mmds;
 mod overlaybd_snapshot;
 mod pool;
@@ -26,5 +27,7 @@ pub(super) use instance::{
     FirecrackerInstance, TapHandoff, SANDBOX_NET_IFACE_ID, SANDBOX_TAP_IFACE_NAME,
 };
 pub use pool::FirecrackerPool;
-pub use sandbox::{FirecrackerCaptureArtifacts, FirecrackerPausedState, FirecrackerSandbox};
+pub use sandbox::{
+    FirecrackerCaptureArtifacts, FirecrackerPausedState, FirecrackerSandbox, PauseMode,
+};
 pub(crate) use startup_pack::record_startup_pack;

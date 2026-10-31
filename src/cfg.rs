@@ -562,7 +562,9 @@ pub struct MemorySnapshotConfig {
     #[config(default = "$AENV_HOME/overlaybd/mem-overlaybd-global.json")]
     pub overlaybd_global_config_path: PathBuf,
     /// Enable Firecracker KVM dirty-page tracking for memory snapshots.
-    /// Default: true; set the environment variable to false to use mincore.
+    /// Required for pausing: every memory-persistence path (the varlen
+    /// harvest and the per-pause layer fallback alike) reads Firecracker
+    /// dirty ranges. Default: true; PVM disables it (untested combination).
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
     pub track_dirty_pages: bool,
     /// Compress memory snapshot layers as ZFile when pausing instead of
