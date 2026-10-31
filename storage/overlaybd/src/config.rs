@@ -143,6 +143,16 @@ impl Default for DownloadConfig {
     }
 }
 
+/// Private variable-length packed memory layer (`mem.upper`) attached to an
+/// otherwise immutable lower stack (design §4.1). Present only on sandbox
+/// memory image configs under the varlen pause protocol.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MemUpperConfig {
+    /// Absolute or image-config-relative path of the `mem.upper` file.
+    pub file: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ImageConfig {
@@ -154,6 +164,8 @@ pub struct ImageConfig {
     pub download_override: Option<DownloadConfig>,
     pub acceleration_layer: bool,
     pub record_trace_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_upper: Option<MemUpperConfig>,
 }
 
 impl ImageConfig {
@@ -502,6 +514,9 @@ pub fn resolve_image_config_local_paths(image_config_path: &Path, cfg: &mut Imag
     resolve_path_field(base_dir, &mut cfg.upper.gzip_index);
     resolve_path_field(base_dir, &mut cfg.result_file);
     resolve_path_field(base_dir, &mut cfg.record_trace_path);
+    if let Some(mem_upper) = &mut cfg.mem_upper {
+        resolve_path_field(base_dir, &mut mem_upper.file);
+    }
 }
 
 fn resolve_path_field(base_dir: &Path, value: &mut String) {
@@ -691,6 +706,17 @@ pub fn validate_image_config(cfg: &ImageConfig) -> Result<()> {
         !cfg.lowers.is_empty() || has_writable_upper,
         "image config has no lowers and no writable upper"
     );
+
+    if let Some(mem_upper) = &cfg.mem_upper {
+        ensure!(
+            !mem_upper.file.is_empty(),
+            "memUpper.file must not be empty"
+        );
+        ensure!(
+            !has_writable_upper,
+            "memUpper cannot be combined with a writable upper"
+        );
+    }
 
     for layer in &cfg.lowers {
         ensure!(
@@ -1247,6 +1273,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: "./trace.log".to_string(),
+            mem_upper: None,
         };
 
         resolve_image_config_local_paths(image_path, &mut cfg);

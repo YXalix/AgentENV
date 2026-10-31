@@ -819,6 +819,7 @@ async fn test_registry_e2e_upper_compact_to_local_lower() -> Result<()> {
         download_override: Some(disabled_download_config()),
         acceleration_layer: false,
         record_trace_path: String::new(),
+        mem_upper: None,
     };
     let compact_cfg_path = tmp.path().join("image-compact-reopen.json");
     write_image_cfg(&compact_cfg_path, &compact_cfg)?;

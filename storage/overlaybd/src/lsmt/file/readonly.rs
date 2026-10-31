@@ -200,6 +200,29 @@ impl LSMTReadOnlyFile {
         }
     }
 
+    /// Builds a read-only file from explicit layers and a caller-supplied
+    /// index (I-2). Used by the mem_upper varlen view: the index shades a
+    /// private upper layer over an immutable lower stack. `index_view` stays
+    /// `None` because the index is not a `ReadOnlyIndex`, so the result can
+    /// serve reads and compaction but cannot act as an RW upper's lower.
+    pub fn from_layers_with_index(
+        layers: Vec<Arc<dyn VirtualFile>>,
+        index: Arc<dyn LogIndex>,
+        virtual_size: u64,
+        uuids: Vec<Uuid>,
+        file_type: LSMTFileType,
+    ) -> Self {
+        Self {
+            index,
+            index_view: None,
+            layers,
+            virtual_size,
+            max_io_size: AtomicUsize::new(MAX_IO_SIZE),
+            uuids,
+            file_type,
+        }
+    }
+
     /// Core read logic that reads directly into the caller-provided buffer,
     /// avoiding intermediate allocations.
     ///
