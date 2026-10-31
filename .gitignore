@@ -68,3 +68,6 @@ env/
 
 ### Node.js
 node_modules/
+
+plans
+.zcode
