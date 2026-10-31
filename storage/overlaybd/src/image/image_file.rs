@@ -11,8 +11,9 @@ use crate::lsmt::file::{
     open_file_rw, open_files_ro_with_premerged_cache, stack_files, CommitArgs, DataStat, LSMTFile,
     LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy, PARALLEL_LOAD_INDEX,
 };
+use crate::mem_upper::reader::{assemble_varlen_composite, MemUpperState};
 use crate::prefetch::{new_prefetcher, PrefetchMode, Prefetcher};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
@@ -384,6 +385,22 @@ impl ImageFile {
         Ok(descriptor)
     }
 
+    /// Opens the varlen mem view for an image config carrying a `memUpper`
+    /// section: lower stack (premerged index reused) + `MemUpperFile` shaded
+    /// by the `VarlenIndex`, zero merge at open (I-2).
+    async fn open_varlen_mem_view(
+        mem_upper: &crate::config::MemUpperConfig,
+        lower: LSMTReadOnlyFile,
+    ) -> Result<LSMTReadOnlyFile> {
+        let file: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::open_ro(&mem_upper.file)
+                .with_context(|| format!("open mem.upper {}", mem_upper.file))?,
+        );
+        let mem_spec = lower.size().await?;
+        let state = MemUpperState::open(file, mem_spec).await?;
+        assemble_varlen_composite(Arc::new(state), Some(lower))
+    }
+
     async fn init_image_file(
         config: &ImageConfig,
         image_service: &ImageService,
@@ -445,17 +462,25 @@ impl ImageFile {
                 prefetcher,
                 replay_prefetch,
             },
-            (Some(lower), None) => InitializedImageFile {
-                state: LiveImageState {
-                    config: config.clone(),
-                    base: ImageFileBase::ReadOnly(lower),
-                    premerged_index_cache_dir: premerged_index_cache_dir.clone(),
-                    premerged_index_cache_policy,
-                },
-                downloads: lowers.downloads,
-                prefetcher,
-                replay_prefetch,
-            },
+            (Some(lower), None) => {
+                let base = match &config.mem_upper {
+                    Some(mem_upper) => {
+                        ImageFileBase::ReadOnly(Self::open_varlen_mem_view(mem_upper, lower).await?)
+                    }
+                    None => ImageFileBase::ReadOnly(lower),
+                };
+                InitializedImageFile {
+                    state: LiveImageState {
+                        config: config.clone(),
+                        base,
+                        premerged_index_cache_dir: premerged_index_cache_dir.clone(),
+                        premerged_index_cache_policy,
+                    },
+                    downloads: lowers.downloads,
+                    prefetcher,
+                    replay_prefetch,
+                }
+            }
             (None, Some(upper)) => InitializedImageFile {
                 state: LiveImageState {
                     config: config.clone(),
@@ -977,6 +1002,64 @@ impl VirtualFile for ImageFile {
     }
 }
 
+/// Opens the lower stack of an image config as a merged read-only file,
+/// mirroring the daemon's open path (premerged index cache included). The
+/// config must not carry a `memUpper` section. Used by the host crate for
+/// harvest stitch/template views and legacy-stack migration.
+pub async fn open_lower_stack_from_config(
+    image_service: &ImageService,
+    image_config_path: &Path,
+) -> Result<LSMTReadOnlyFile> {
+    let config = image_service.load_image_config(image_config_path)?;
+    ensure!(
+        config.mem_upper.is_none(),
+        "lower-stack open does not accept a memUpper config: {}",
+        image_config_path.display()
+    );
+    let download_cfg = config
+        .effective_download(image_service.global_config())
+        .clone();
+    let opened = ImageFile::open_lowers(
+        &config.lowers,
+        &config.repo_blob_url,
+        &download_cfg,
+        false,
+        image_service,
+        None,
+    )
+    .await?;
+    opened.file.context("image config has no lower layers")
+}
+
+/// Opens the varlen composite (lower stack shaded by `mem.upper`) for an
+/// image config carrying a `memUpper` section.
+pub async fn open_varlen_composite_from_config(
+    image_service: &ImageService,
+    image_config_path: &Path,
+) -> Result<LSMTReadOnlyFile> {
+    let config = image_service.load_image_config(image_config_path)?;
+    let mem_upper = config.mem_upper.as_ref().with_context(|| {
+        format!(
+            "image config has no memUpper: {}",
+            image_config_path.display()
+        )
+    })?;
+    let download_cfg = config
+        .effective_download(image_service.global_config())
+        .clone();
+    let opened = ImageFile::open_lowers(
+        &config.lowers,
+        &config.repo_blob_url,
+        &download_cfg,
+        false,
+        image_service,
+        None,
+    )
+    .await?;
+    let lower = opened.file.context("memUpper config has no lower layers")?;
+    ImageFile::open_varlen_mem_view(mem_upper, lower).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1382,6 +1465,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -1425,6 +1509,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -1484,6 +1569,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -1532,6 +1618,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -1596,6 +1683,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -1645,6 +1733,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -1735,6 +1824,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -1821,6 +1911,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -1910,6 +2001,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -1972,6 +2064,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let image = ImageFile::open(image_cfg, build_service(tmp).await, None)
@@ -2113,6 +2206,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_oss_service(&tmp, &endpoint, "us-east-1").await;
@@ -2179,6 +2273,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -2272,6 +2367,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let image = ImageFile::open(image_cfg, service, None)
@@ -2304,6 +2400,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let err = ImageFile::open(image_cfg, service, None)
@@ -2355,6 +2452,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let image = ImageFile::open(image_cfg, service, None)
@@ -2416,6 +2514,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let image = ImageFile::open(image_cfg, service, None)
@@ -2467,6 +2566,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let image = ImageFile::open(image_cfg, service, None)
@@ -2549,6 +2649,7 @@ mod tests {
             }),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -2672,6 +2773,7 @@ mod tests {
             }),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -2761,6 +2863,7 @@ mod tests {
             }),
             acceleration_layer: false,
             record_trace_path: trace_path.to_string_lossy().into_owned(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -2838,6 +2941,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: true,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -2872,6 +2976,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -3030,6 +3135,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service(&tmp).await;
@@ -3082,6 +3188,7 @@ mod tests {
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: false,
             record_trace_path: String::new(),
+            mem_upper: None,
         };
 
         let service = build_service_with_io_engine(&tmp, IO_ENGINE_LIBAIO).await;

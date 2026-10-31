@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
-    BaseSandboxNetworkPolicy, FirecrackerSandbox, FirecrackerSnapshotConfig, SandboxBackend,
-    SandboxExecutor, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    BaseSandboxNetworkPolicy, FirecrackerSandbox, FirecrackerSnapshotConfig, PauseMode,
+    SandboxBackend, SandboxExecutor, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
 };
 use anyhow::{bail, Context, Result};
 use overlaybd::backend::local::LocalFile;
@@ -351,7 +351,9 @@ async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
 
     write_disk_marker(&mut sandbox).await?;
     let snapshot_dir = tempfile::tempdir()?;
-    let (snapshot, _) = sandbox.pause_to_dir(snapshot_dir.path()).await?;
+    let (snapshot, _) = sandbox
+        .pause_to_dir(snapshot_dir.path(), PauseMode::Storm)
+        .await?;
     sandbox.stop().await?;
 
     assert!(snapshot.vm_state_path.exists());
@@ -522,7 +524,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     // Also test pause_to_dir with snapshot-owned inherited layer adoption.
     let expected_snapshot_dir = tempfile::tempdir()?;
     let (dir_snapshot, _) = resumed_again
-        .pause_to_dir(expected_snapshot_dir.path())
+        .pause_to_dir(expected_snapshot_dir.path(), PauseMode::Storm)
         .await?;
     resumed_again.stop().await?;
     let managed_snapshot_base_root = ConfigManager::global_config()

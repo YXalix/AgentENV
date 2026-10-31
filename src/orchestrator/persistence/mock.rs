@@ -109,6 +109,10 @@ impl SandboxPersister for RecordingPersister {
         Ok(None)
     }
 
+    async fn record_exists(&self, _sandbox_id: &SandboxId) -> PersistenceResult<bool> {
+        Ok(false)
+    }
+
     async fn persist_paused(
         &self,
         _metadata: &SandboxMetadata,

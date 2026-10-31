@@ -8,6 +8,7 @@ mod image;
 mod io;
 mod layer;
 mod lsmt;
+pub mod mem_upper;
 
 pub mod format {
     pub use crate::lsmt::format::*;

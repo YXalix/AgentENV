@@ -38,6 +38,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_FIRECRACKER_WORK_DIR` | `$AENV_HOME/firecracker-work` | Override the parent directory for per-sandbox Firecracker work directories. |
 | `AENV_FIRECRACKER_SERIAL_DIR` | `$AENV_HOME/logs/serial` | Override the directory for persistent Firecracker serial output. Files are grouped under `{serial_dir}/{sandbox_id}/`. |
 | `AENV_PERSISTED_SANDBOX_STORE_PATH` | `$AENV_HOME/persisted-sandboxes` | Override the directory where paused sandbox state is persisted across server restarts. |
+| `AGENTENV_MEMORY_SNAPSHOT_PAUSE_PROTOCOL` | `varlen` | Overrides `[memory_snapshot].pause_protocol`: `varlen` uses the single-file `mem.upper` storm-pause path, `legacy` keeps one OverlayBD layer per pause. Automatically downgraded to `legacy` when dirty-page tracking is disabled. |
 
 ## E2B SDK / CLI
 

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
 use tempfile::TempDir;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
@@ -16,10 +16,11 @@ use super::config::{
     FirecrackerRuntimePolicy, FirecrackerSandboxConfig, FirecrackerSnapshotConfig,
     PersistentSnapshotRootGuard, MAX_EXTRA_DRIVES,
 };
+use super::mem_upper_pause;
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
-    build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
-    restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
+    build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd, fsync_file_and_rename,
+    restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs, write_bytes_atomically,
 };
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::{FirecrackerInstance, SANDBOX_NET_IFACE_ID, SANDBOX_TAP_IFACE_NAME};
@@ -259,9 +260,19 @@ impl PausedSandboxState for FirecrackerPausedState {
     }
 
     fn runtime_artifacts(&self) -> RuntimeArtifactSet {
-        RuntimeArtifactSet::from_overlaybd_image_configs(rootfs_and_extra_drive_image_config_paths(
-            &self.snapshot_config.common,
-        ))
+        let mut paths = rootfs_and_extra_drive_image_config_paths(&self.snapshot_config.common);
+        // Varlen paused states keep a local-only stable mem root (mem.upper +
+        // image.json) that is NOT repository-backed, so it must be
+        // registered like the other local artifacts.
+        if self.snapshot_config.mem_upper_path.is_some() {
+            paths.push(
+                self.snapshot_config
+                    .mem_overlaybd_config
+                    .image_config_path
+                    .clone(),
+            );
+        }
+        RuntimeArtifactSet::from_overlaybd_image_configs(paths)
     }
 }
 
@@ -367,9 +378,11 @@ impl SandboxBackend for FirecrackerSandbox {
         artifact_root: Option<&Path>,
     ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
         let pause_result = match artifact_root {
-            Some(artifact_root) => FirecrackerSandbox::pause_to_dir(self, artifact_root)
-                .await
-                .map(|(snapshot_config, _)| snapshot_config),
+            Some(artifact_root) => {
+                FirecrackerSandbox::pause_to_dir(self, artifact_root, PauseMode::Storm)
+                    .await
+                    .map(|(snapshot_config, _)| snapshot_config)
+            }
             None => FirecrackerSandbox::pause(self).await,
         };
         let snapshot_config = match pause_result {
@@ -386,14 +399,15 @@ impl SandboxBackend for FirecrackerSandbox {
             .map_err(SandboxCaptureError::from)?;
         let snapshot_dir = live_snapshot_root.path().join(Uuid::now_v7().to_string());
 
-        let (snapshot_config, manifest) = match self.pause_to_dir(&snapshot_dir).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return self
-                    .recover_capture_failure("snapshot capture", error)
-                    .await
-            }
-        };
+        let (snapshot_config, manifest) =
+            match self.pause_to_dir(&snapshot_dir, PauseMode::Capture).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return self
+                        .recover_capture_failure("snapshot capture", error)
+                        .await
+                }
+            };
         FirecrackerSandbox::resume(self)
             .await
             .map_err(SandboxCaptureError::terminal)?;
@@ -411,7 +425,7 @@ impl SandboxBackend for FirecrackerSandbox {
         SandboxSnapshotManifest,
         Option<Box<dyn std::any::Any + Send>>,
     )> {
-        match self.pause_to_dir(at).await {
+        match self.pause_to_dir(at, PauseMode::Capture).await {
             Ok((snapshot_config, manifest)) => Ok((manifest, Some(Box::new(snapshot_config)))),
             Err(error) => self.recover_capture_failure("capture", error).await,
         }
@@ -1141,7 +1155,7 @@ impl FirecrackerSandbox {
         snapshot_root.prepare().await?;
         let snapshot_dir = snapshot_root.path().join(Uuid::now_v7().to_string());
 
-        let (mut snapshot, _) = self.pause_to_dir(&snapshot_dir).await?;
+        let (mut snapshot, _) = self.pause_to_dir(&snapshot_dir, PauseMode::Capture).await?;
         snapshot.managed_snapshot_root = Some(snapshot_root);
 
         Ok(snapshot)
@@ -1152,8 +1166,9 @@ impl FirecrackerSandbox {
     pub async fn pause_to_dir(
         &mut self,
         snapshot_dir: &Path,
+        mode: PauseMode,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
-        debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
+        debug!(snapshot_dir = %snapshot_dir.display(), ?mode, "pausing sandbox");
         if self.has_writable_persistent_volumes() {
             let envd = self
                 .envd_instance
@@ -1167,11 +1182,23 @@ impl FirecrackerSandbox {
             .await
             .with_context(|| format!("create snapshot dir {}", snapshot_dir.display()))?;
 
-        let snapshot_result = self.snapshot_to_dir(snapshot_dir).await;
+        let mut attempt = SnapshotAttempt::default();
+        let snapshot_result = self.snapshot_to_dir(snapshot_dir, mode, &mut attempt).await;
         match snapshot_result {
             Ok(snapshot) => Ok(snapshot),
             Err(err) => {
-                Self::cleanup_failed_snapshot_dir(snapshot_dir).await;
+                if attempt.rootfs_sealed {
+                    // The sealed rootfs layer is the only durable copy of the
+                    // runtime upper and the VM can no longer be resumed, so
+                    // keep the partially written snapshot dir for teardown
+                    // and forensics instead of removing it.
+                    warn!(
+                        snapshot_dir = %snapshot_dir.display(),
+                        "snapshot failed after the rootfs seal; keeping sealed artifacts"
+                    );
+                } else {
+                    Self::cleanup_failed_snapshot_dir(snapshot_dir).await;
+                }
                 Err(err)
             }
         }
@@ -1180,6 +1207,8 @@ impl FirecrackerSandbox {
     async fn snapshot_to_dir(
         &self,
         snapshot_dir: &Path,
+        mode: PauseMode,
+        attempt: &mut SnapshotAttempt,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
         // Memory layers stay raw unless `[memory_snapshot].compression_enabled`
@@ -1191,82 +1220,43 @@ impl FirecrackerSandbox {
             &global_config.memory_snapshot,
             &global_config.snapshot.publish_compression,
         );
-        let (mem_layer_path, mem_virtual_size) = self
-            .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
-            .await?;
 
-        // Build the memory image config: collect parent layers, make runtime
-        // lowers local to this snapshot dir, and compact only if the layer
-        // count exceeds the configured maximum.
-        let resume_mem_image_config_path = match &self.launch {
-            LaunchMode::Resume(config) => {
-                Some(config.mem_overlaybd_config.image_config_path.as_path())
+        // Storm pauses seal the rootfs first: once the live upper is sealed
+        // the runtime is no longer resumable, every later failure is
+        // terminal, and the in-place retry below never seals twice
+        // (design §4.2). Captures keep the legacy order so recoverable
+        // failures can still restore Running.
+        let mut rootfs_stage = match mode {
+            PauseMode::Storm => Some(self.snapshot_rootfs_stage(snapshot_dir).await?),
+            PauseMode::Capture => None,
+        };
+        attempt.rootfs_sealed = rootfs_stage.is_some();
+
+        let memory = {
+            let result = self
+                .snapshot_memory_stage(snapshot_dir, mode, &memory_output, attempt)
+                .await;
+            match result {
+                Ok(memory) => memory,
+                Err(first) if mode == PauseMode::Storm => {
+                    // In-place retry over frozen RAM: vm_state and the varlen
+                    // harvest are content-convergent even when the first
+                    // attempt tore payloads or metadata (design D5).
+                    warn!(error = ?first, "storm memory stage failed; retrying once in place");
+                    self.snapshot_memory_stage(snapshot_dir, mode, &memory_output, attempt)
+                        .await
+                        .context("storm memory stage failed twice")?
+                }
+                Err(first) => return Err(first),
             }
-            LaunchMode::Fresh(_) => None,
-        };
-        let mem_image_config = build_mem_snapshot_image_config(
-            resume_mem_image_config_path,
-            &mem_layer_path,
-            snapshot_dir,
-            memory_output,
-        )
-        .await?;
-        let mem_image_config_path = snapshot_dir.join("mem_image.json");
-        tokio::fs::write(
-            &mem_image_config_path,
-            serde_json::to_vec_pretty(&mem_image_config)
-                .context("serialize mem image config for persistent dir")?,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "write mem image config to {}",
-                mem_image_config_path.display()
-            )
-        })?;
-
-        let mem_overlaybd_config = OverlaybdConfig {
-            image_config_path: mem_image_config_path,
-            read_only: true,
-            runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
         };
 
-        let (base_rootfs_path, rootfs_virtual_size) = if self.uses_overlaybd_ublk() {
-            let overlaybd_source = self
-                .launch
-                .common()
-                .ublk_config
-                .as_ref()
-                .map(|config| match &config.backend {
-                    UblkBackend::Overlaybd(source) => source,
-                })
-                .context("overlaybd snapshot requires overlaybd-backed ublk config")?;
-            let rootfs_runtime = self
-                .rootfs_runtime
-                .as_ref()
-                .context("overlaybd snapshot requires an active ublk device")?;
-            let rootfs_image_path = restack_snapshot_overlaybd_rootfs(
-                &rootfs_runtime.device,
-                overlaybd_source.read_only,
-                &rootfs_runtime.image_config_path,
-                snapshot_dir,
-            )
-            .await
-            .context("snapshot overlaybd runtime state to persistent dir")?;
-            let size = self
-                .snapshot_rootfs_virtual_size()
-                .context("persist rootfs virtual size for snapshot")?;
-            (rootfs_image_path, size)
-        } else {
-            let rootfs_path = snapshot_dir.join(ROOTFS_DRIVE_PATH);
-            // Preserve the writable disk state alongside the snapshot.
-            let current_rootfs = self.work_dir.path().join(ROOTFS_DRIVE_PATH);
-            copy_cow(&current_rootfs, &rootfs_path).await?;
-            let size = self
-                .snapshot_rootfs_virtual_size()
-                .context("persist rootfs virtual size for snapshot")?;
-            (rootfs_path, size)
+        let rootfs_stage = match rootfs_stage.take() {
+            Some(stage) => stage,
+            None => self.snapshot_rootfs_stage(snapshot_dir).await?,
         };
+        let (base_rootfs_path, rootfs_virtual_size) = rootfs_stage;
+
         let snapshot_extra_drives = self
             .snapshot_extra_drives(snapshot_dir)
             .await
@@ -1303,6 +1293,13 @@ impl FirecrackerSandbox {
         });
         snapshot_common.rootfs_virtual_size = Some(rootfs_virtual_size);
 
+        let mem_overlaybd_config = OverlaybdConfig {
+            image_config_path: memory.image_config_path.clone(),
+            read_only: true,
+            runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+        };
+        let mem_virtual_size = memory.mem_virtual_size;
+
         let mut manifest = SandboxSnapshotManifest::new(
             crate::sandbox::FIRECRACKER_BACKEND,
             vm_state_path.clone(),
@@ -1322,9 +1319,21 @@ impl FirecrackerSandbox {
             mem_overlaybd_config,
             mem_virtual_size,
             managed_snapshot_root: None,
+            mem_upper_path: memory.mem_upper_path,
+            mem_upper_epoch: memory.mem_upper_epoch,
             pack_recording: false,
             memory_startup_pack: None,
         };
+
+        // Capture on a varlen-state sandbox ends by switching the parent to
+        // the collapsed lower stack: mem.upper's only reader becomes the
+        // sandbox's own resume again (design §4.4, T1).
+        if let Some(switch) = attempt.pending_parent_switch.take() {
+            switch
+                .apply()
+                .await
+                .context("switch parent mem stack after capture")?;
+        }
 
         debug!(
             vm_state_path = %snapshot.vm_state_path.display(),
@@ -1335,29 +1344,201 @@ impl FirecrackerSandbox {
         Ok((snapshot, manifest))
     }
 
-    async fn snapshot_memory_to_overlaybd(
+    /// Seals (or raw-copies) the rootfs into the snapshot dir and returns the
+    /// captured image config path plus its virtual size.
+    async fn snapshot_rootfs_stage(&self, snapshot_dir: &Path) -> Result<(PathBuf, u64)> {
+        if self.uses_overlaybd_ublk() {
+            let overlaybd_source = self
+                .launch
+                .common()
+                .ublk_config
+                .as_ref()
+                .map(|config| match &config.backend {
+                    UblkBackend::Overlaybd(source) => source,
+                })
+                .context("overlaybd snapshot requires overlaybd-backed ublk config")?;
+            let rootfs_runtime = self
+                .rootfs_runtime
+                .as_ref()
+                .context("overlaybd snapshot requires an active ublk device")?;
+            let rootfs_image_path = restack_snapshot_overlaybd_rootfs(
+                &rootfs_runtime.device,
+                overlaybd_source.read_only,
+                &rootfs_runtime.image_config_path,
+                snapshot_dir,
+            )
+            .await
+            .context("snapshot overlaybd runtime state to persistent dir")?;
+            let size = self
+                .snapshot_rootfs_virtual_size()
+                .context("persist rootfs virtual size for snapshot")?;
+            Ok((rootfs_image_path, size))
+        } else {
+            let rootfs_path = snapshot_dir.join(ROOTFS_DRIVE_PATH);
+            // Preserve the writable disk state alongside the snapshot.
+            let current_rootfs = self.work_dir.path().join(ROOTFS_DRIVE_PATH);
+            copy_cow(&current_rootfs, &rootfs_path).await?;
+            let size = self
+                .snapshot_rootfs_virtual_size()
+                .context("persist rootfs virtual size for snapshot")?;
+            Ok((rootfs_path, size))
+        }
+    }
+
+    /// Persists vm state and guest memory for the paused VM.
+    ///
+    /// Storm pauses under the varlen protocol harvest into the stable
+    /// `mem.upper`; everything else (including the S-c legacy fallback and
+    /// all captures) keeps today's per-pause layer materialization.
+    async fn snapshot_memory_stage(
         &self,
-        vm_state_path: &Path,
         snapshot_dir: &Path,
-        memory_output: OverlaybdCompactOutput,
-    ) -> Result<(PathBuf, u64)> {
-        let mem_overlaybd_dir = snapshot_dir.join("mem_overlaybd");
+        mode: PauseMode,
+        memory_output: &OverlaybdCompactOutput,
+        attempt: &mut SnapshotAttempt,
+    ) -> Result<MemoryStage> {
+        let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
+        // Write vm state through a temp name, then fsync + rename so the
+        // final `vm_state.bin` only ever appears fully written.
+        let vm_state_tmp_path = snapshot_dir.join(format!("{VM_STATE_FILE_NAME}.tmp"));
         let firecracker_pid = self.fc_instance.pid()?;
         self.fc_instance
-            .create_state_only_snapshot(vm_state_path)
+            .create_state_only_snapshot(&vm_state_tmp_path)
             .await?;
+        fsync_file_and_rename(&vm_state_tmp_path, &vm_state_path, "vm state snapshot")?;
         // `vm_state.bin` now represents this paused VM state. Any later
-        // error aborts this direct snapshot attempt and is propagated to
-        // the lifecycle caller for recovery.
+        // error aborts this direct snapshot attempt and is propagated to the
+        // lifecycle caller for recovery.
         let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
-        convert_dirty_memory_to_overlaybd(
+
+        let (launch_mem_image, launch_mem_upper, launch_mem_size) = match &self.launch {
+            LaunchMode::Resume(config) => (
+                Some(config.mem_overlaybd_config.image_config_path.as_path()),
+                config.mem_upper_path.as_deref(),
+                config.mem_virtual_size,
+            ),
+            LaunchMode::Fresh(_) => (None, None, 0),
+        };
+
+        // Fresh-booted sandboxes have no parent mem stack to splice from;
+        // their first pause stays on the legacy path (which handles the
+        // empty-parent case), and the varlen migration kicks in on the next
+        // pause after the first resume.
+        let varlen_storm = mode == PauseMode::Storm
+            && matches!(self.launch, LaunchMode::Resume(_))
+            && ConfigManager::global_config()
+                .memory_snapshot
+                .pause_protocol
+                == crate::cfg::PauseProtocol::Varlen;
+        if varlen_storm {
+            let stable_root = mem_upper_pause::stable_mem_root(snapshot_dir);
+            match mem_upper_pause::harvest_varlen_memory(
+                firecracker_pid,
+                &dirty_ranges,
+                &stable_root,
+                launch_mem_image,
+                launch_mem_upper,
+                launch_mem_size,
+            )
+            .await
+            .context("varlen mem harvest")
+            {
+                Ok(mem_upper_pause::VarlenPause::Harvested(outcome)) => {
+                    return Ok(MemoryStage {
+                        image_config_path: outcome.stable_image_config,
+                        mem_virtual_size: dirty_ranges
+                            .memory_size
+                            .try_into()
+                            .context("dirty memory_size")?,
+                        mem_upper_path: Some(outcome.mem_upper_path),
+                        mem_upper_epoch: outcome.epoch,
+                    });
+                }
+                Ok(mem_upper_pause::VarlenPause::Legacy) => {
+                    // Throttled migration: pause legacy this cycle.
+                }
+                Err(err) => {
+                    // Post-seal failures are terminal by construction in
+                    // storm mode; do not let the caller attempt a resume.
+                    return Err(SandboxCaptureError::terminal(
+                        err.context("varlen mem harvest failed"),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // Legacy per-pause layer path (also the varlen capture conversion
+        // target: captures on a varlen sandbox first collapse the varlen
+        // view into an immutable lower, then materialize the dirty pages on
+        // top of it — design §4.4).
+        let resume_mem_image_config_path = match launch_mem_upper {
+            Some(mem_upper_path) => {
+                let stable_image =
+                    launch_mem_image.context("varlen state requires a mem image config")?;
+                let output_dir = snapshot_dir.join("mem_overlaybd");
+                tokio::fs::create_dir_all(&output_dir)
+                    .await
+                    .with_context(|| {
+                        format!("create mem overlaybd dir: {}", output_dir.display())
+                    })?;
+                let collapsed = mem_upper_pause::collapse_varlen_mem(stable_image, &output_dir)
+                    .await
+                    .context("collapse varlen mem into immutable lower")?;
+                let parent_config = snapshot_dir.join("mem_parent.json");
+                mem_upper_pause::write_collapsed_parent_config(
+                    stable_image,
+                    &collapsed,
+                    &parent_config,
+                )
+                .await?;
+                let stable_root = stable_image.parent().unwrap_or_else(|| Path::new("."));
+                attempt.pending_parent_switch = Some(ParentSwitch {
+                    stable_image: stable_image.to_path_buf(),
+                    stable_lowers: stable_root.join("lowers.json"),
+                    mem_upper: mem_upper_path.to_path_buf(),
+                    collapsed,
+                });
+                Some(parent_config)
+            }
+            None => launch_mem_image.map(PathBuf::from),
+        };
+
+        let mem_overlaybd_dir = snapshot_dir.join("mem_overlaybd");
+        let (mem_layer_path, mem_virtual_size) = convert_dirty_memory_to_overlaybd(
             firecracker_pid,
             &dirty_ranges,
             &mem_overlaybd_dir,
-            memory_output,
+            *memory_output,
         )
         .await
-        .context("convert dirty memory ranges to overlaybd layer")
+        .context("convert dirty memory ranges to overlaybd layer")?;
+
+        // Build the memory image config: collect parent layers, make runtime
+        // lowers local to this snapshot dir, and compact only if the layer
+        // count exceeds the configured maximum.
+        let mem_image_config = build_mem_snapshot_image_config(
+            resume_mem_image_config_path.as_deref(),
+            &mem_layer_path,
+            snapshot_dir,
+            *memory_output,
+        )
+        .await?;
+        let image_config_path = snapshot_dir.join("mem_image.json");
+        write_bytes_atomically(
+            &image_config_path,
+            &serde_json::to_vec_pretty(&mem_image_config)
+                .context("serialize mem image config for persistent dir")?,
+            "mem image config",
+        )
+        .context("write mem image config atomically")?;
+
+        Ok(MemoryStage {
+            image_config_path,
+            mem_virtual_size,
+            mem_upper_path: None,
+            mem_upper_epoch: 0,
+        })
     }
 
     /// Resume a paused sandbox in-place.
@@ -1573,11 +1754,90 @@ impl FirecrackerSandbox {
     }
 }
 
+/// Which pause flavor is running; decides ordering and the memory path
+/// (design §4.0, I-7). Storm pauses belong to the resume/exec/pause/sleep
+/// cycle: seal-first, terminal post-seal failures, varlen harvest when
+/// enabled. Captures (snapshot/fork/publish) keep the legacy order and
+/// recoverable-failure semantics, converting varlen state via collapse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseMode {
+    Storm,
+    Capture,
+}
+
+/// Tracks how far one pause attempt got, so failure handling and the
+/// post-capture parent switch do the right thing.
+#[derive(Default)]
+struct SnapshotAttempt {
+    rootfs_sealed: bool,
+    pending_parent_switch: Option<ParentSwitch>,
+}
+
+/// Outcome of the memory stage: where the resumed mem stack lives.
+struct MemoryStage {
+    image_config_path: PathBuf,
+    mem_virtual_size: u64,
+    mem_upper_path: Option<PathBuf>,
+    mem_upper_epoch: u64,
+}
+
+/// Deferred post-capture switch of a varlen parent onto the collapsed lower
+/// stack (design §4.4): rewrites the stable image pair and resets
+/// `mem.upper` so the file's only reader is the sandbox's own resume again.
+struct ParentSwitch {
+    stable_image: PathBuf,
+    stable_lowers: PathBuf,
+    mem_upper: PathBuf,
+    collapsed: PathBuf,
+}
+
+impl ParentSwitch {
+    async fn apply(&self) -> Result<()> {
+        let mut config: overlaybd::config::ImageConfig =
+            serde_json::from_str(&tokio::fs::read_to_string(&self.stable_image).await?)
+                .with_context(|| format!("parse {}", self.stable_image.display()))?;
+        overlaybd::config::resolve_image_config_local_paths(&self.stable_image, &mut config);
+        config.mem_upper = None;
+        config.lowers.push(overlaybd::config::LayerConfig {
+            file: self.collapsed.display().to_string(),
+            ..overlaybd::config::LayerConfig::default()
+        });
+        let bytes =
+            serde_json::to_vec_pretty(&config).context("serialize switched mem image config")?;
+        write_bytes_atomically(&self.stable_image, &bytes, "switched mem image config")?;
+        write_bytes_atomically(&self.stable_lowers, &bytes, "switched lowers config")?;
+
+        // Reset mem.upper in place: the old generation is fully represented
+        // by the collapsed lower now.
+        let mem_spec = config_header_mem_spec(&self.mem_upper)?;
+        tokio::fs::remove_file(&self.mem_upper)
+            .await
+            .with_context(|| format!("remove old {}", self.mem_upper.display()))?;
+        let fresh = overlaybd::mem_upper::MemUpperWriter::create(&self.mem_upper, mem_spec)
+            .with_context(|| format!("reset {}", self.mem_upper.display()))?;
+        drop(fresh);
+        info!(
+            stable_image = %self.stable_image.display(),
+            collapsed = %self.collapsed.display(),
+            "switched parent mem stack onto collapsed lower"
+        );
+        Ok(())
+    }
+}
+
+fn config_header_mem_spec(mem_upper: &Path) -> Result<u64> {
+    let raw = std::fs::read(mem_upper).with_context(|| format!("read {}", mem_upper.display()))?;
+    // Header is the first 4K; mem_spec sits at offset 16.
+    anyhow::ensure!(raw.len() >= 24, "mem.upper header truncated");
+    Ok(u64::from_le_bytes(raw[16..24].try_into().unwrap()))
+}
+
 /// Overlaybd image config paths a sandbox opens (rootfs + extra drives).
 /// For fresh launches these are source configs; for paused states they are
 /// snapshot artifact configs.
-/// (Memory snapshot layers are remote/repository-backed, never local-only, so
-/// they are not included.)
+/// (Legacy memory snapshot layers are remote/repository-backed, never
+/// local-only, so they are not included; varlen states add their stable mem
+/// image config at the call sites that know about `mem_upper`.)
 fn rootfs_and_extra_drive_image_config_paths(common: &FirecrackerCommonConfig) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(rootfs) = &common.rootfs_image_config {
@@ -1946,6 +2206,25 @@ impl FirecrackerSandbox {
         );
 
         let global_config = ConfigManager::global_config();
+
+        // Epoch contract (design D2-A): a record whose epoch disagrees with
+        // the file header refers to an orphaned generation — likely a stale
+        // record left by a torn harvest. Discard it loudly instead of
+        // resuming torn state.
+        if let Some(mem_upper_path) = &config.mem_upper_path {
+            let file_epoch = overlaybd::mem_upper::read_mem_upper_epoch(mem_upper_path)
+                .with_context(|| format!("read mem.upper epoch {}", mem_upper_path.display()))?;
+            if file_epoch != config.mem_upper_epoch {
+                // Fail hard: this is a torn-generation record, not a
+                // transient fault, so the orchestrator must clean it up.
+                return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
+                    "mem.upper epoch mismatch at {}: file holds {file_epoch}, record holds {}",
+                    mem_upper_path.display(),
+                    config.mem_upper_epoch
+                ))
+                .into());
+            }
+        }
 
         let rootfs_virtual_size = config
             .common
@@ -3221,6 +3500,8 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            mem_upper_path: None,
+            mem_upper_epoch: 0,
             pack_recording: false,
         });
 
@@ -3253,6 +3534,8 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            mem_upper_path: None,
+            mem_upper_epoch: 0,
             pack_recording: false,
             memory_startup_pack: None,
         };
@@ -3308,6 +3591,8 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            mem_upper_path: None,
+            mem_upper_epoch: 0,
             pack_recording: false,
         })?;
         let common = value["common"]

@@ -381,6 +381,18 @@ track_dirty_pages = true
 # unchanged.
 compression_enabled = false
 
+# Storm-pause memory protocol (lightweight pause design).
+#   varlen: guest RAM persists into the per-sandbox single-file mem.upper
+#           (16KiB blocks, variable-length packed compressed payloads,
+#           incremental 8B/block index, zero layer growth, page-cache reuse
+#           across pause/resume cycles). Existing legacy-state sandboxes
+#           migrate on their first varlen pause.
+#   legacy: one OverlayBD layer per pause (the historical append path).
+# Automatically downgraded to "legacy" with a warning when dirty-page
+# tracking is disabled (including PVM). Flip with
+# AGENTENV_MEMORY_SNAPSHOT_PAUSE_PROTOCOL.
+pause_protocol = "varlen"
+
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd
 # becomes ready.

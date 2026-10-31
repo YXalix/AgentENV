@@ -557,6 +557,19 @@ pub enum OverlaybdCompressionAlgorithm {
     Zstd,
 }
 
+/// Storm-pause memory protocol (design: lightweight pause, mem 变长打包).
+/// `varlen` persists guest memory into the per-sandbox single-file
+/// `mem.upper` variable-length packed layer (no new layers, incremental
+/// index, page-cache reuse across cycles); `legacy` keeps today's
+/// one-OverlayBD-layer-per-pause append path.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseProtocol {
+    #[default]
+    Varlen,
+    Legacy,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct MemorySnapshotConfig {
     #[config(default = "$AENV_HOME/overlaybd/mem-overlaybd-global.json")]
@@ -565,6 +578,11 @@ pub struct MemorySnapshotConfig {
     /// Default: true; set the environment variable to false to use mincore.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
     pub track_dirty_pages: bool,
+    /// Storm pause memory protocol; see [`PauseProtocol`]. Automatically
+    /// downgraded to `legacy` (with a warning) when dirty-page tracking is
+    /// disabled, because the varlen harvest is driven by dirty ranges.
+    #[config(env = "AGENTENV_MEMORY_SNAPSHOT_PAUSE_PROTOCOL", default = "varlen")]
+    pub pause_protocol: PauseProtocol,
     /// Compress memory snapshot layers as ZFile when pausing instead of
     /// leaving them raw. Default: false so local pause/resume keeps paying
     /// no decompression cost; enabled, the algorithm and worker count come
@@ -1031,6 +1049,17 @@ impl AppConfig {
         // validation so an existing PVM configuration needs no new override.
         if self.virtualization_mode == VirtualizationMode::Pvm {
             self.memory_snapshot.track_dirty_pages = false;
+        }
+
+        // The varlen pause protocol is driven by Firecracker dirty ranges;
+        // without dirty-page tracking it silently degrades to legacy.
+        if !self.memory_snapshot.track_dirty_pages
+            && self.memory_snapshot.pause_protocol == PauseProtocol::Varlen
+        {
+            tracing::warn!(
+                "memory_snapshot.pause_protocol downgraded to legacy because dirty-page tracking is disabled"
+            );
+            self.memory_snapshot.pause_protocol = PauseProtocol::Legacy;
         }
 
         self.cluster.normalize();

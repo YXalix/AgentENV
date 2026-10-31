@@ -477,6 +477,15 @@ pub struct FirecrackerSnapshotConfig {
     /// a manifest). Runtime-only, never persisted.
     #[serde(skip)]
     pub memory_startup_pack: Option<crate::snapshot::ResolvedStartupPack>,
+    /// Stable `mem.upper` path when this state uses the varlen pause
+    /// protocol; `None` for legacy layer stacks. Serde defaults keep records
+    /// written by older binaries decodable.
+    #[serde(default)]
+    pub mem_upper_path: Option<PathBuf>,
+    /// Epoch of `mem_upper_path` at pause time; the resume path rejects a
+    /// mismatching file as an orphaned generation (design D2-A).
+    #[serde(default)]
+    pub mem_upper_epoch: u64,
 }
 
 impl FirecrackerSnapshotConfig {
@@ -562,6 +571,8 @@ impl FirecrackerSnapshotConfig {
             mem_overlaybd_config,
             mem_virtual_size: manifest.memory.virtual_size,
             managed_snapshot_root: None,
+            mem_upper_path: None,
+            mem_upper_epoch: 0,
             pack_recording: false,
             memory_startup_pack: manifest.memory_startup_pack.clone(),
         })
@@ -603,6 +614,11 @@ impl FirecrackerSnapshotConfig {
                 "mem overlaybd image config not found at {}",
                 self.mem_overlaybd_config.image_config_path.display()
             );
+        }
+        if let Some(mem_upper_path) = &self.mem_upper_path {
+            if !mem_upper_path.exists() {
+                anyhow::bail!("varlen mem.upper not found at {}", mem_upper_path.display());
+            }
         }
         let rootfs_path = &rootfs_image_config.image_config_path;
         if !rootfs_path.exists() {
@@ -892,6 +908,8 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            mem_upper_path: None,
+            mem_upper_epoch: 0,
             pack_recording: false,
         };
 

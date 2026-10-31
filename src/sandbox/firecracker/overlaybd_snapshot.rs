@@ -43,7 +43,7 @@ const INHERITED_LAYERS_DIR: &str = "inherited-layers";
 const MANAGED_BASE_LAYER_FILE: &str = "managed-base.commit";
 const FIRECRACKER_DIRTY_PAGE_SIZE: u64 = 4096;
 const OVERLAYBD_ALIGNMENT: u64 = 512;
-const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
+pub(crate) const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
 
 enum LiveOverlaybdSnapshotState {
     ReadOnly,
@@ -254,7 +254,7 @@ fn on_same_filesystem(src_path: &Path, dst_dir: &Path) -> Result<bool> {
     Ok(src_meta.dev() == dst_meta.dev())
 }
 
-fn write_bytes_atomically(path: &Path, bytes: &[u8], description: &str) -> Result<()> {
+pub(crate) fn write_bytes_atomically(path: &Path, bytes: &[u8], description: &str) -> Result<()> {
     let parent = path.parent().with_context(|| {
         format!(
             "{description} path has no parent directory: {}",
@@ -285,6 +285,29 @@ fn sync_parent_directory(parent: &Path) -> Result<()> {
     std::fs::File::open(parent)
         .and_then(|dir| dir.sync_all())
         .with_context(|| format!("sync parent directory {}", parent.display()))
+}
+
+/// Durably moves a fully written file to its final name: fsync the file,
+/// rename, then fsync the parent directory so the rename itself is durable.
+pub(crate) fn fsync_file_and_rename(src: &Path, dst: &Path, description: &str) -> Result<()> {
+    let parent = dst.parent().with_context(|| {
+        format!(
+            "{description} path has no parent directory: {}",
+            dst.display()
+        )
+    })?;
+    std::fs::File::open(src)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("sync temp {description} {}", src.display()))?;
+    std::fs::rename(src, dst).with_context(|| {
+        format!(
+            "rename {description} {} -> {}",
+            src.display(),
+            dst.display()
+        )
+    })?;
+    sync_parent_directory(parent)?;
+    Ok(())
 }
 
 async fn copy_file_atomically(src: &Path, dst: &Path, description: &str) -> Result<()> {
@@ -659,7 +682,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     .await
 }
 
-async fn publish_memory_overlaybd_layer(
+pub(crate) async fn publish_memory_overlaybd_layer(
     src_layers: &[Arc<dyn VirtualFile>],
     mappings: &[SegmentMapping],
     virtual_size: u64,

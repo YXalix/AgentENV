@@ -17,6 +17,12 @@ impl ProcessVmReader {
         Self { pid }
     }
 
+    /// Inherent alias so the `RemoteBlockReader` impl can delegate without
+    /// resolving to itself.
+    pub(super) fn read_exact_remote_inherent(&self, addr: u64, dst: &mut [u8]) -> Result<()> {
+        self.read_exact_remote(addr, dst)
+    }
+
     // TODO: `process_vm_readv` is synchronous and currently runs on the Tokio
     // worker polling `VirtualFile::read_at_into`. Offloading it without an
     // extra memory copy requires an owned-buffer interface or a dedicated
