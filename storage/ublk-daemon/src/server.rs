@@ -1731,8 +1731,21 @@ async fn idle_released_device(
     dev: UVMUblkDev<OverlaybdTarget>,
     business_image: Arc<ImageFile>,
 ) {
-    // Clear page cache before returning to pool.
-    clear_page_cache(&dev.device_path());
+    // Fail closed (T3): a device whose page cache could not be cleared must
+    // never return to the pool — stale guest pages would survive the swap
+    // and corrupt the next reader. Destroy the device instead; the caller's
+    // pause already treats a terminal teardown accordingly.
+    if let Err(error) = clear_page_cache_injectable(&dev.device_path()) {
+        tracing::error!(
+            dev_id,
+            path = %dev.device_path().display(),
+            error = %error,
+            "BLKFLSBUF failed on release; destroying device instead of pooling (fail closed)"
+        );
+        drop(business_image);
+        stop_overlaybd_device(ctrl_ring, dev).await;
+        return;
+    }
 
     let virtual_size = business_image.size_bytes();
     let (placeholder_config, placeholder_image) = match pool.placeholder_for(virtual_size).await {
@@ -2022,8 +2035,32 @@ fn update_device_size(
     dev.ctrl.update_size(new_sectors)
 }
 
-/// Best-effort page cache clear for a block device using BLKFLSBUF ioctl.
-fn clear_page_cache(device_path: &Path) {
+/// Injectable cache-clear implementation so tests can exercise the
+/// fail-closed release path without a real block device (I-9).
+#[cfg(test)]
+pub(crate) type ClearPageCacheFn =
+    std::sync::Arc<dyn Fn(&Path) -> std::io::Result<()> + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CLEAR_PAGE_CACHE: std::cell::RefCell<Option<ClearPageCacheFn>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn clear_page_cache_injectable(device_path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if let Some(injected) =
+            TEST_CLEAR_PAGE_CACHE.with(|slot| slot.borrow().as_ref().map(std::sync::Arc::clone))
+        {
+            return injected(device_path);
+        }
+    }
+    clear_page_cache(device_path)
+}
+
+/// Real BLKFLSBUF cache clear.
+fn clear_page_cache(device_path: &Path) -> std::io::Result<()> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -2034,31 +2071,54 @@ fn clear_page_cache(device_path: &Path) {
     // value libc-agnostic and infer the ABI-specific type at the call site.
     const BLKFLSBUF: u32 = 0x1261;
 
-    let file = match OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(device_path)
-    {
-        Ok(file) => file,
-        Err(err) => {
+        .map_err(|err| {
             tracing::warn!(?err, path = %device_path.display(), "failed to open device for cache clear");
-            return;
-        }
-    };
+            err
+        })?;
 
     let fd = file.as_raw_fd();
     let ret = unsafe { libc::ioctl(fd, BLKFLSBUF as _) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         tracing::warn!(?err, path = %device_path.display(), "failed to clear page cache");
+        Err(err)
     } else {
         tracing::debug!(path = %device_path.display(), "cleared page cache");
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_page_cache_reports_open_failure() {
+        // Fail-closed contract: an unopenable device surfaces as an error
+        // instead of being swallowed (T3).
+        assert!(clear_page_cache(Path::new("/nonexistent/ublkbN")).is_err());
+    }
+
+    #[test]
+    fn clear_page_cache_injection_routes_injected_results() {
+        use std::io;
+
+        let inject = |f: ClearPageCacheFn| {
+            TEST_CLEAR_PAGE_CACHE.with(|slot| *slot.borrow_mut() = Some(f));
+        };
+        inject(Arc::new(|_path| Err(io::Error::other("injected failure"))));
+        assert!(clear_page_cache_injectable(Path::new("/dev/null")).is_err());
+        inject(Arc::new(|_path| Ok(())));
+        assert!(clear_page_cache_injectable(Path::new("/dev/null")).is_ok());
+        TEST_CLEAR_PAGE_CACHE.with(|slot| *slot.borrow_mut() = None);
+        // Without injection the real implementation runs; /dev/null is not a
+        // block device, so BLKFLSBUF fails — still an error, never silent.
+        assert!(clear_page_cache_injectable(Path::new("/dev/null")).is_err());
+    }
     use tempfile::TempDir;
 
     /// Minimal local `ImageService`; placeholder images have no lowers, so this
