@@ -3,6 +3,7 @@ use std::io;
 
 pub const CAP_NET_ADMIN: i32 = 12;
 pub const CAP_SYS_ADMIN: i32 = 21;
+pub const CAP_SYS_NICE: i32 = 23;
 
 const PR_CAP_AMBIENT: libc::c_int = 47;
 const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;

@@ -75,6 +75,15 @@ async fn make_orchestrator_with_factory(factory: MockBackendFactory) -> Arc<Test
     .expect("in-memory orchestrator should not fail to construct")
 }
 
+fn make_v_pause_orchestrator(behavior: Arc<MockBehavior>) -> Arc<TestOrchestrator> {
+    let mut orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+    );
+    Arc::get_mut(&mut orchestrator).unwrap().v_pause_enabled = true;
+    orchestrator
+}
+
 fn make_orchestrator_without_background<S: MetadataStore + 'static>(
     store: S,
 ) -> Arc<TestOrchestrator<S>> {
@@ -119,6 +128,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         sandbox_metrics: Mutex::new(SandboxMetrics::default()),
         sandbox_event_tx,
         default_sandbox_timeout: Duration::from_secs(15),
+        v_pause_enabled: false,
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_outcome: tokio::sync::OnceCell::new(),
@@ -1620,6 +1630,172 @@ async fn pause_resume_transitions_and_is_idempotent() -> Result<()> {
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn v_pause_retains_live_handle_and_resumes_in_place() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_v_pause_orchestrator(Arc::clone(&behavior));
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    orchestrator.pause_sandbox(created.id).await?;
+    let paused = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("vPaused metadata");
+    assert_eq!(paused.state, SandboxState::Paused);
+    assert!(paused.paused_state.is_none());
+    assert!(orchestrator
+        .sandboxes
+        .read()
+        .await
+        .contains_key(&created.id));
+    assert_eq!(behavior.stop_calls(), 0);
+    assert_proxy_paused(&orchestrator, &created.id).await?;
+
+    let resumed = orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await?;
+    assert_eq!(resumed.state, SandboxState::Running);
+    assert!(orchestrator
+        .sandboxes
+        .read()
+        .await
+        .contains_key(&created.id));
+    assert_eq!(behavior.stop_calls(), 0);
+    assert_proxy_ready(&orchestrator, &created.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_v_pause_converts_to_heavy_pause() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_v_pause_orchestrator(Arc::clone(&behavior));
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+    orchestrator
+        .store
+        .update_if_state(&created.id, &[SandboxState::Paused], |metadata| {
+            metadata.expires_at = Some(SystemTime::now() - Duration::from_secs(1));
+        })
+        .await?;
+
+    orchestrator.evict_expired_sandboxes().await?;
+    let paused = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("heavy-paused metadata");
+    assert_eq!(paused.state, SandboxState::Paused);
+    assert!(paused.paused_state.is_some());
+    assert!(!orchestrator
+        .sandboxes
+        .read()
+        .await
+        .contains_key(&created.id));
+    assert_eq!(behavior.stop_calls(), 1);
+
+    // The proxy route was removed during vPause, so the heavy-pause conversion
+    // had to rebuild it from the sandbox handle; resuming must serve it.
+    let resumed = orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await?;
+    assert_eq!(resumed.state, SandboxState::Running);
+    assert_proxy_ready(&orchestrator, &created.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_v_resume_stays_paused_and_can_retry() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::VResume,
+        MockAction::Fail {
+            message: "resume failed".to_string(),
+        },
+    );
+    let orchestrator = make_v_pause_orchestrator(behavior);
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+
+    orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await
+        .expect_err("vResume should fail");
+    let paused = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("paused metadata");
+    assert_eq!(paused.state, SandboxState::Paused);
+    assert_proxy_paused(&orchestrator, &created.id).await?;
+
+    orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await?;
+    assert_proxy_ready(&orchestrator, &created.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_converts_v_pause_to_heavy_pause() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_v_pause_orchestrator(Arc::clone(&behavior));
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+
+    orchestrator.shutdown().await?;
+    let paused = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("heavy-paused metadata");
+    assert_eq!(paused.state, SandboxState::Paused);
+    assert!(paused.paused_state.is_some());
+    assert!(!orchestrator
+        .sandboxes
+        .read()
+        .await
+        .contains_key(&created.id));
+    assert_eq!(behavior.stop_calls(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_v_pause_restores_running_route() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::VPause,
+        MockAction::Fail {
+            message: "pageout failed".to_string(),
+        },
+    );
+    let orchestrator = make_v_pause_orchestrator(behavior);
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect_err("vPause should fail");
+    let running = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("running metadata");
+    assert_eq!(running.state, SandboxState::Running);
+    assert_proxy_ready(&orchestrator, &created.id).await?;
     Ok(())
 }
 

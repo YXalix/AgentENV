@@ -49,6 +49,8 @@ pub enum MockOperation {
     StartNowait,
     WaitForReady,
     Pause,
+    VPause,
+    VResume,
     Resume,
     Snapshot,
     CaptureToDir,
@@ -317,6 +319,14 @@ impl SandboxBackend for MockSandboxBackend {
             return Err(pause_err);
         }
         Ok(Arc::new(MockSnapshot))
+    }
+
+    async fn v_pause(&mut self) -> Result<()> {
+        self.behavior.apply_async(MockOperation::VPause).await
+    }
+
+    async fn v_resume(&mut self) -> Result<()> {
+        self.behavior.apply_async(MockOperation::VResume).await
     }
 
     async fn resume(&mut self) -> Result<()> {

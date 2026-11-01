@@ -175,6 +175,7 @@ pub struct FirecrackerSandbox {
     work_dir: TempDir,
     fc_instance: FirecrackerInstance,
     runtime_policy: FirecrackerRuntimePolicy,
+    v_paused: bool,
     network_slot: Option<Slot>,
     current_network_policy: Option<SandboxNetworkPolicy>,
     /// Current custom extension params. Initialized from the launch config and
@@ -377,6 +378,40 @@ impl SandboxBackend for FirecrackerSandbox {
             Err(error) => return self.recover_capture_failure("pause", error).await,
         };
         Ok(Arc::new(FirecrackerPausedState::new(snapshot_config)))
+    }
+
+    async fn v_pause(&mut self) -> Result<()> {
+        if self.v_paused {
+            return Ok(());
+        }
+        self.fc_instance.pause().await?;
+        self.v_paused = true;
+        match self.fc_instance.pageout_guest_memory().await {
+            Ok(bytes) => {
+                metrics::counter!("agentenv_v_pause_pageout_advised_bytes_total").increment(bytes);
+                debug!(bytes, "guest memory pageout advised for vPause");
+                Ok(())
+            }
+            Err(error) => {
+                metrics::counter!("agentenv_v_pause_pageout_failures_total").increment(1);
+                if let Err(resume_error) = self.fc_instance.resume().await {
+                    return Err(error.context(format!(
+                        "failed to page out guest memory and resume sandbox: {resume_error:#}"
+                    )));
+                }
+                self.v_paused = false;
+                Err(error.context("failed to page out guest memory; sandbox resumed"))
+            }
+        }
+    }
+
+    async fn v_resume(&mut self) -> Result<()> {
+        if !self.v_paused {
+            return Ok(());
+        }
+        self.fc_instance.resume().await?;
+        self.v_paused = false;
+        Ok(())
     }
 
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
@@ -1155,13 +1190,17 @@ impl FirecrackerSandbox {
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
         if self.has_writable_persistent_volumes() {
+            self.v_resume().await?;
             let envd = self
                 .envd_instance
                 .clone()
                 .context("cannot flush writable volumes because envd is not running")?;
             Self::sync_writable_volume_filesystems(envd).await?;
         }
-        self.fc_instance.pause().await?;
+        if !self.v_paused {
+            self.fc_instance.pause().await?;
+            self.v_paused = true;
+        }
 
         tokio::fs::create_dir_all(snapshot_dir)
             .await
@@ -1363,9 +1402,11 @@ impl FirecrackerSandbox {
     /// Resume a paused sandbox in-place.
     ///
     /// Use this when you want to keep the same sandbox instance.
-    pub async fn resume(&self) -> Result<()> {
+    pub async fn resume(&mut self) -> Result<()> {
         debug!("resuming paused sandbox in-place");
-        self.fc_instance.resume().await
+        self.fc_instance.resume().await?;
+        self.v_paused = false;
+        Ok(())
     }
 
     /// Resume a new sandbox instance from snapshot config.
@@ -1452,6 +1493,10 @@ impl FirecrackerSandbox {
 
         debug!("firecracker sandbox stopped");
         Ok(())
+    }
+
+    pub fn firecracker_pid(&self) -> Result<i32> {
+        Ok(self.fc_instance.pid()?.as_raw())
     }
 
     pub(crate) fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr> {
@@ -1726,6 +1771,7 @@ impl FirecrackerSandbox {
             launch,
             work_dir,
             fc_instance,
+            v_paused: false,
             network_slot: None,
             current_network_policy,
             current_custom_extension_params,

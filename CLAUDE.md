@@ -182,8 +182,11 @@ Reuse shared helpers: `src/local_store.rs` (`LocalKvStore`, explicit
 ## Constraints to Preserve
 
 - **Lifecycle:** Recoverable capture/fork errors restore `Running`; terminal
-  errors require teardown. Graceful shutdown persists sandboxes as `Paused`.
-  Keep `CapturedSandboxSnapshot` alive until repository publication completes.
+  errors require teardown. With `[v_pause]` enabled, explicit Pause retains the
+  live VM and pages guest RAM to host swap without persisted state; timeout and
+  graceful shutdown resume it and then use persistent heavy-pause. vPause is not
+  crash-recoverable. Keep `CapturedSandboxSnapshot` alive until repository
+  publication completes.
 - **Storage:** Commit logical layer references, not node-local paths. Cache GC
   must not delete durable artifacts or live writable uppers. Use
   `UblkDeviceManager`; preserve shared-memory device reference counts and COW.

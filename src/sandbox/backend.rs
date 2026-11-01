@@ -228,6 +228,12 @@ pub trait SandboxBackend: Send + 'static {
         artifact_root: Option<&Path>,
     ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>>;
 
+    /// Pause the VM in place and reclaim its guest memory without capturing state.
+    async fn v_pause(&mut self) -> Result<()>;
+
+    /// Resume a VM paused by [`Self::v_pause`].
+    async fn v_resume(&mut self) -> Result<()>;
+
     /// Resume a paused but not-yet-stopped sandbox from its snapshot.
     ///
     /// Idempotent: calling `resume` more than once must not return an error.
