@@ -13,8 +13,8 @@ provisions `/dev/kvm` permissions, loads the `ublk_drv` kernel module, and
 downloads the required AgentENV runtime assets.
 
 Installation requires root, but the installed service does not run as root. It
-uses a dedicated `aenv` system account with `CAP_NET_ADMIN` and
-`CAP_SYS_ADMIN`, plus group access to `/dev/kvm` and the ublk devices.
+uses a dedicated `aenv` system account with `CAP_NET_ADMIN`, `CAP_SYS_ADMIN`,
+and `CAP_SYS_NICE`, plus group access to `/dev/kvm` and the ublk devices.
 
 ## Setup
 

@@ -122,6 +122,7 @@ pub struct Orchestrator<
     sandbox_metrics: Mutex<SandboxMetrics>,
     sandbox_event_tx: broadcast::Sender<SandboxLifecycleEvent>,
     default_sandbox_timeout: Duration,
+    v_pause_enabled: bool,
     is_shutting_down: std::sync::atomic::AtomicBool,
     shutdown_tx: watch::Sender<bool>,
     shutdown_outcome: OnceCell<ShutdownOutcome>,
@@ -241,6 +242,7 @@ where
             sandbox_metrics: Mutex::new(SandboxMetrics::default()),
             sandbox_event_tx,
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
+            v_pause_enabled: app_config.v_pause.effective(app_config.virtualization_mode),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
             shutdown_tx,
             shutdown_outcome: OnceCell::new(),
@@ -1176,7 +1178,7 @@ where
             .await
     }
 
-    async fn claim_expired_running_sandbox(
+    async fn claim_expired_sandbox(
         &self,
         sandbox_id: SandboxId,
         cutoff: SystemTime,
@@ -1184,11 +1186,15 @@ where
     ) -> Result<bool> {
         match self
             .store
-            .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
-                if metadata.is_expired(cutoff) {
-                    metadata.state = claimed_state;
-                }
-            })
+            .update_if_state(
+                &sandbox_id,
+                &[SandboxState::Running, SandboxState::Paused],
+                |metadata| {
+                    if metadata.is_expired(cutoff) {
+                        metadata.state = claimed_state;
+                    }
+                },
+            )
             .await
         {
             Ok(update) if update.current.state == claimed_state => Ok(true),
@@ -1383,11 +1389,7 @@ where
         outcome.as_result()
     }
 
-    /// Pauses a running sandbox by taking a snapshot and stopping its VM.
-    ///
-    /// If another `pause_sandbox` call is already in progress for the same
-    /// sandbox (`Pausing` state), this call waits for it to complete and then
-    /// returns the outcome rather than duplicating the work.
+    /// Pauses a running sandbox in place when vPause is enabled, otherwise captures and stops it.
     pub async fn pause_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("pause", sandbox_id, async move {
@@ -1402,36 +1404,158 @@ where
         fields(sandbox_id = %sandbox_id)
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
-        info!("pausing sandbox");
+        if self.v_pause_enabled {
+            self.v_pause_sandbox_inner(sandbox_id).await
+        } else {
+            self.heavy_pause_sandbox_inner(sandbox_id).await
+        }
+    }
+
+    async fn heavy_pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        info!("heavy-pausing sandbox");
+        if self.transition_running_to_pausing(sandbox_id).await? {
+            self.pause_sandbox_impl(sandbox_id).await
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn heavy_pause_v_paused_sandbox_inner(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> Result<()> {
+        let handle = self
+            .sandboxes
+            .read()
+            .await
+            .get(&sandbox_id)
+            .cloned()
+            .ok_or_else(|| {
+                OrchestratorError::InternalError(format!(
+                    "live-vPaused sandbox {sandbox_id} has no runtime handle"
+                ))
+            })?;
+        self.store
+            .update_state_if_state(&sandbox_id, SandboxState::Resuming, &[SandboxState::Paused])
+            .await?;
+        self.v_resume_sandbox_impl(sandbox_id, handle, NewTimeout::UseExisting)
+            .await?;
+        self.heavy_pause_sandbox_inner(sandbox_id).await
+    }
+
+    async fn v_pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        info!("v-pausing sandbox");
+        if self.transition_running_to_pausing(sandbox_id).await? {
+            self.v_pause_sandbox_impl(sandbox_id).await
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn transition_running_to_pausing(&self, sandbox_id: SandboxId) -> Result<bool> {
         match self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
             .await
         {
-            Ok(_) => {}
-            Err(StoreError::StateConflict { actual_state, .. }) => {
-                return match actual_state {
-                    // Another task is already performing the pause.  Wait for
-                    // it to finish and then report the final outcome.
-                    SandboxState::Pausing => self.join_concurrent_pause(sandbox_id).await,
-                    SandboxState::Paused => Ok(()),
-                    SandboxState::Killing => {
-                        info!("sandbox is being deleted while pausing");
-                        Err(OrchestratorError::SandboxNotFound(sandbox_id))
-                    }
-                    _ => {
-                        info!(state = ?actual_state, "cannot pause sandbox in current state");
-                        Err(OrchestratorError::InvalidSandboxState {
-                            sandbox_id,
-                            state: actual_state,
-                        })
-                    }
-                };
-            }
-            Err(err) => return Err(OrchestratorError::from(err)),
+            Ok(_) => Ok(true),
+            Err(StoreError::StateConflict { actual_state, .. }) => match actual_state {
+                SandboxState::Pausing => {
+                    self.join_concurrent_pause(sandbox_id).await?;
+                    Ok(false)
+                }
+                SandboxState::Paused => Ok(false),
+                SandboxState::Killing => Err(OrchestratorError::SandboxNotFound(sandbox_id)),
+                _ => Err(OrchestratorError::InvalidSandboxState {
+                    sandbox_id,
+                    state: actual_state,
+                }),
+            },
+            Err(err) => Err(OrchestratorError::from(err)),
+        }
+    }
+
+    async fn v_pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
+        let removed_route = self.proxy_routes.write().await.remove(&sandbox_id);
+        let Some(handle) = handle else {
+            self.store.remove(&sandbox_id).await?;
+            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+        };
+
+        let pause_result = handle.lock().await.v_pause().await;
+        if let Err(error) = pause_result {
+            self.rollback_v_pause(sandbox_id, &handle, removed_route)
+                .await?;
+            return Err(OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::Pause,
+                source: error,
+            });
         }
 
-        self.pause_sandbox_impl(sandbox_id).await
+        let update = self
+            .store
+            .update_if_state(&sandbox_id, &[SandboxState::Pausing], |metadata| {
+                metadata.state = SandboxState::Paused;
+                metadata.paused_state = None;
+            })
+            .await;
+        let metadata = match update {
+            Ok(update) => update.current,
+            Err(error) => {
+                self.rollback_v_pause(sandbox_id, &handle, removed_route)
+                    .await?;
+                return Err(error.into());
+            }
+        };
+        self.publish_sandbox_event(
+            SandboxLifecycleEventType::Pause,
+            sandbox_id,
+            metadata.resources,
+        );
+        Ok(())
+    }
+
+    async fn rollback_v_pause(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+        removed_route: Option<ProxyRoute>,
+    ) -> Result<()> {
+        let resume_result = handle.lock().await.v_resume().await;
+        if let Err(resume_error) = resume_result {
+            let error = self
+                .teardown_failed_v_pause(
+                    sandbox_id,
+                    handle,
+                    format!("vPause failed and sandbox could not resume: {resume_error:#}"),
+                )
+                .await?;
+            return Err(error);
+        }
+        self.restore_proxy_route(sandbox_id, removed_route).await;
+        self.store
+            .update_state_if_state(&sandbox_id, SandboxState::Running, &[SandboxState::Pausing])
+            .await?;
+        Ok(())
+    }
+
+    /// Stop a sandbox whose vPause recovery failed, finalize its volumes, and
+    /// remove it from the store. Returns the fatal error to surface, or a
+    /// store error if teardown itself fails.
+    async fn teardown_failed_v_pause(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+        message: String,
+    ) -> Result<OrchestratorError> {
+        let _ = handle.lock().await.stop().await;
+        if let Some(metadata) = self.store.get(&sandbox_id).await? {
+            self.finalize_terminal_volumes(&metadata).await;
+        }
+        self.store.remove(&sandbox_id).await?;
+        Ok(OrchestratorError::InternalError(message))
     }
 
     async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
@@ -1524,9 +1648,13 @@ where
                     }
                     self.store.remove(&sandbox_id).await?;
                 } else {
+                    self.restore_proxy_route_after_heavy_pause(
+                        sandbox_id,
+                        &handle,
+                        removed_proxy_route,
+                    )
+                    .await;
                     self.sandboxes.write().await.insert(sandbox_id, handle);
-                    self.restore_proxy_route(sandbox_id, removed_proxy_route)
-                        .await;
                     let _ = self
                         .store
                         .update_state_if_state(
@@ -1586,9 +1714,13 @@ where
                     warn!(error = ?error, "failed to remove sandbox after pause failure");
                 }
             } else {
+                self.restore_proxy_route_after_heavy_pause(
+                    sandbox_id,
+                    &handle,
+                    removed_proxy_route,
+                )
+                .await;
                 self.sandboxes.write().await.insert(sandbox_id, handle);
-                self.restore_proxy_route(sandbox_id, removed_proxy_route)
-                    .await;
                 let _ = self
                     .store
                     .update_state_if_state(
@@ -1723,6 +1855,12 @@ where
             Err(err) => return Err(OrchestratorError::from(err)),
         }
 
+        if let Some(handle) = self.sandboxes.read().await.get(&sandbox_id).cloned() {
+            return self
+                .v_resume_sandbox_impl(sandbox_id, handle, timeout)
+                .await;
+        }
+
         if let Err(err) = self.persister.mark_resuming(&sandbox_id).await {
             warn!(error = ?err, "failed to mark persisted sandbox record as resuming");
             let _ = self
@@ -1760,6 +1898,99 @@ where
             );
         }
         resumed
+    }
+
+    async fn v_resume_sandbox_impl(
+        &self,
+        sandbox_id: SandboxId,
+        handle: SandboxHandle,
+        timeout: NewTimeout,
+    ) -> Result<SandboxMetadata> {
+        let proxy_target = {
+            let sandbox = handle.lock().await;
+            Self::proxy_target_from_sandbox(sandbox.as_ref())
+        };
+        let proxy_target = match proxy_target {
+            Ok(target) => target,
+            Err(source) => {
+                let error = self
+                    .rollback_failed_v_resume(sandbox_id, source.into())
+                    .await?;
+                return Err(error);
+            }
+        };
+        if let Err(source) = handle.lock().await.v_resume().await {
+            let error = self.rollback_failed_v_resume(sandbox_id, source).await?;
+            return Err(error);
+        }
+
+        self.upsert_proxy_route(sandbox_id, proxy_target).await;
+        let update = self
+            .store
+            .update_if_state(&sandbox_id, &[SandboxState::Resuming], |metadata| {
+                metadata.state = SandboxState::Running;
+                metadata.paused_state = None;
+                metadata.update_timeout(timeout);
+            })
+            .await;
+        let metadata = match update {
+            Ok(update) => update.current,
+            Err(error) => {
+                self.rollback_failed_running_commit(sandbox_id, &handle)
+                    .await?;
+                return Err(error.into());
+            }
+        };
+        self.publish_sandbox_event(
+            SandboxLifecycleEventType::Resume,
+            sandbox_id,
+            metadata.resources,
+        );
+        Ok(metadata)
+    }
+
+    /// A vResume step failed while the sandbox is still vPaused: restore the
+    /// Paused state and surface the failure as a resume operation error.
+    async fn rollback_failed_v_resume(
+        &self,
+        sandbox_id: SandboxId,
+        source: anyhow::Error,
+    ) -> Result<OrchestratorError> {
+        self.store
+            .update_state_if_state(&sandbox_id, SandboxState::Paused, &[SandboxState::Resuming])
+            .await?;
+        Ok(OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation: SandboxOperation::Resume,
+            source,
+        })
+    }
+
+    /// Committing Running failed after a successful vResume: drop the route,
+    /// vPause the sandbox again (tearing it down if that fails), and restore
+    /// the Paused state so the store error can surface.
+    async fn rollback_failed_running_commit(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+    ) -> Result<()> {
+        let _ = self.proxy_routes.write().await.remove(&sandbox_id);
+        if let Err(pause_error) = handle.lock().await.v_pause().await {
+            let error = self
+                .teardown_failed_v_pause(
+                    sandbox_id,
+                    handle,
+                    format!(
+                        "vResume metadata update failed and sandbox could not be paused again: {pause_error:#}"
+                    ),
+                )
+                .await?;
+            return Err(error);
+        }
+        self.store
+            .update_state_if_state(&sandbox_id, SandboxState::Paused, &[SandboxState::Resuming])
+            .await?;
+        Ok(())
     }
 
     /// Captures a snapshot of a running sandbox.
@@ -2270,7 +2501,12 @@ where
         let mut evicted_ids = Vec::new();
 
         for metadata in expired {
-            if metadata.state != SandboxState::Running {
+            let is_live = match metadata.state {
+                SandboxState::Running => true,
+                SandboxState::Paused => self.sandboxes.read().await.contains_key(&metadata.id),
+                _ => false,
+            };
+            if !is_live {
                 continue;
             }
             let claimed_state = match metadata.timeout_action {
@@ -2280,20 +2516,27 @@ where
             // Use the same operation lock as explicit deletion before claiming Killing.
             let deletion = self.deletion_progress(metadata.id).await;
             let mut progress = deletion.lock().await;
-            let result = match self
-                .claim_expired_running_sandbox(metadata.id, eviction_cutoff, claimed_state)
-                .await
+            let result = if metadata.state == SandboxState::Paused
+                && matches!(metadata.timeout_action, SandboxTimeoutAction::Pause)
             {
-                Ok(true) => match metadata.timeout_action {
-                    SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
-                    SandboxTimeoutAction::Delete => {
-                        self.delete_sandbox_impl(metadata.id, SandboxState::Running, &mut progress)
-                            .await
+                self.heavy_pause_v_paused_sandbox_inner(metadata.id)
+                    .await
+                    .map(|_| true)
+            } else {
+                match self
+                    .claim_expired_sandbox(metadata.id, eviction_cutoff, claimed_state)
+                    .await
+                {
+                    Ok(true) => match metadata.timeout_action {
+                        SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
+                        SandboxTimeoutAction::Delete => {
+                            self.delete_sandbox_impl(metadata.id, metadata.state, &mut progress)
+                                .await
+                        }
                     }
+                    .map(|_| true),
+                    other => other,
                 }
-                .map(|_| true),
-                Ok(false) => Ok(false),
-                Err(err) => Err(err),
             };
             match result {
                 Ok(true) => evicted_ids.push(metadata.id),
@@ -2763,6 +3006,28 @@ where
             .await;
     }
 
+    async fn restore_proxy_route_after_heavy_pause(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+        route: Option<ProxyRoute>,
+    ) {
+        if route.is_some() {
+            self.restore_proxy_route(sandbox_id, route).await;
+            return;
+        }
+        let target = {
+            let sandbox = handle.lock().await;
+            Self::proxy_target_from_sandbox(sandbox.as_ref())
+        };
+        match target {
+            Ok(target) => self.upsert_proxy_route(sandbox_id, target).await,
+            Err(error) => {
+                warn!(sandbox_id = %sandbox_id, error = ?error, "failed to rebuild proxy route after vPause conversion")
+            }
+        }
+    }
+
     async fn detach_sandbox_handle_and_route(
         &self,
         sandbox_id: &SandboxId,
@@ -2785,15 +3050,21 @@ where
         const MAX_SHUTDOWN_PASSES: usize = 3;
         let mut last_failures = Vec::new();
 
-        // Preserve recoverable sandboxes by pausing running VMs before process exit.
+        // Preserve every live VM, including one already in vPause.
         for pass in 1..=MAX_SHUTDOWN_PASSES {
-            let sandboxes = self
+            let candidates = self
                 .store
-                .list_filtered(SandboxListFilter {
-                    excluded_states: Some(vec![SandboxState::Paused]),
-                    ..SandboxListFilter::matches_all()
-                })
+                .list_filtered(SandboxListFilter::matches_all())
                 .await?;
+            let mut sandboxes = Vec::new();
+            for metadata in candidates {
+                if metadata.state == SandboxState::Paused
+                    && !self.sandboxes.read().await.contains_key(&metadata.id)
+                {
+                    continue;
+                }
+                sandboxes.push(metadata);
+            }
             if sandboxes.is_empty() {
                 break;
             }
@@ -2809,13 +3080,16 @@ where
                 let sandbox_id = metadata.id;
                 match metadata.state {
                     SandboxState::Paused => {
-                        unreachable!("paused sandboxes should have been filtered out")
+                        if let Err(err) = self.heavy_pause_v_paused_sandbox_inner(sandbox_id).await
+                        {
+                            last_failures.push(format!("{sandbox_id}: {err}"));
+                        }
                     }
                     SandboxState::Running => {
                         let result = if metadata.template_builder {
                             self.delete_sandbox_inner(sandbox_id).await
                         } else {
-                            self.pause_sandbox_inner(sandbox_id).await
+                            self.heavy_pause_sandbox_inner(sandbox_id).await
                         };
                         if let Err(err) = result {
                             last_failures.push(format!("{sandbox_id}: {err}"));

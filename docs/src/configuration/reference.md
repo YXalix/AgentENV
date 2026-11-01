@@ -555,6 +555,17 @@ these TOML settings always take effect automatically — any manual edits to the
 generated file are overwritten on the next startup. To keep customizations,
 make them through the TOML settings, not by editing the generated JSON.
 
+## `[v_pause]`
+
+Lightweight in-process Pause for KVM sandboxes. Explicit Pause stops the vCPUs and uses `process_madvise(MADV_PAGEOUT)` on guest memory while retaining the Firecracker process. Resume is lazy and does not recreate the VM. Long-idle timeout and graceful shutdown first resume the VM, then use the persistent heavy-pause path. vPause is node-local and is not recovered after an abnormal server or host crash.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable vPause for explicit Pause requests. PVM continues to use heavy-pause. Enabling requires `CAP_SYS_NICE`. |
+
+vPause relies on host swap, provisioned and sized by the operator; without
+active swap, Pause stops the vCPUs but frees no host memory.
+
 ## `[memory_snapshot]`
 
 Memory snapshot overlaybd configuration. The server auto-generates the file at

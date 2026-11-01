@@ -15,12 +15,13 @@ use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 use tokio::io::unix::AsyncFd;
 use tracing::warn;
 
-pub use linux_cap::{CAP_NET_ADMIN, CAP_SYS_ADMIN};
+pub use linux_cap::{CAP_NET_ADMIN, CAP_SYS_ADMIN, CAP_SYS_NICE};
 
 fn capability_name(capability: i32) -> &'static str {
     match capability {
         CAP_NET_ADMIN => "CAP_NET_ADMIN",
         CAP_SYS_ADMIN => "CAP_SYS_ADMIN",
+        CAP_SYS_NICE => "CAP_SYS_NICE",
         _ => "unknown capability",
     }
 }
@@ -33,7 +34,12 @@ fn capability_name(capability: i32) -> &'static str {
 pub fn require_runtime_capabilities() -> Result<()> {
     let sets = linux_cap::CapabilitySets::current().context("read process capability sets")?;
     let is_root = nix::unistd::Uid::effective().is_root();
-    let missing = [CAP_NET_ADMIN, CAP_SYS_ADMIN]
+    let mut required = vec![CAP_NET_ADMIN, CAP_SYS_ADMIN];
+    let config = crate::cfg::ConfigManager::global_config();
+    if config.v_pause.effective(config.virtualization_mode) {
+        required.push(CAP_SYS_NICE);
+    }
+    let missing = required
         .into_iter()
         .filter(|capability| {
             if is_root {
@@ -47,7 +53,7 @@ pub fn require_runtime_capabilities() -> Result<()> {
 
     if !missing.is_empty() {
         bail!(
-            "AENV runtime is missing required Linux capabilities: {}. Start it with CAP_NET_ADMIN and CAP_SYS_ADMIN in the inheritable, permitted, and effective sets (the installed systemd unit configures this automatically)",
+            "AENV runtime is missing required Linux capabilities: {}. Start with all required capabilities in the inheritable, permitted, and effective sets (the installed systemd unit configures this automatically)",
             missing.join(", ")
         );
     }
@@ -197,6 +203,10 @@ impl ScopedChild {
     /// can report it; signaling after reaping is refused by [`Self::start_kill`].
     pub fn id(&self) -> u32 {
         self.pid
+    }
+
+    pub fn pidfd(&self) -> io::Result<OwnedFd> {
+        self.pidfd.try_clone()
     }
 
     /// Returns the exit status if the child has exited, reaping it.

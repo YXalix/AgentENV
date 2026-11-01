@@ -75,14 +75,17 @@ aenv download 018f0d93-aaaa-bbbb-cccc-0123456789ab /workspace/result.txt ./resul
 
 ## Pause and Resume
 
-Pausing saves the sandbox's current runtime state and stops its 
-microVM. While it is paused, programs inside it do not run, services do not handle requests,
-and the sandbox releases its CPU and memory resources. Its saved state remains
-in storage so the same sandbox can be resumed later.
+When `[v_pause].enabled = true` on a KVM node, explicit Pause stops the vCPUs
+and pages guest memory into host swap while keeping the same microVM
+process. Resume continues that process and faults memory back on demand; no
+snapshot is written. This live-vPause state is node-local and is not recovered
+from an abnormal server or host crash. Long-idle timeout and graceful shutdown
+instead capture persistent state and stop the microVM, so those sandboxes can be
+restored later. With vPause disabled, every Pause uses that persistent path.
 
-After resume, the filesystem, running processes, environment variables, and
-in-memory data are restored to the state captured at pause time. Programs
-continue from that saved state instead of starting again from the beginning.
+After either form of resume, the filesystem, running processes, environment
+variables, and in-memory data continue from the paused state instead of starting
+again from the beginning.
 
 ```bash
 aenv pause <sandbox-id>

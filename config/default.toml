@@ -365,6 +365,12 @@ startup_prewarm = true
 # Maximum concurrent process creations in one refill batch.
 fill_concurrency = 4
 
+[v_pause]
+# Keep explicit Pause in-process: pause vCPUs and page guest RAM into host swap.
+# Requires operator-provided swap; without it, Pause stops vCPUs but frees no memory.
+# Long-idle timeout and graceful shutdown still capture a persistent heavy snapshot.
+enabled = false
+
 [memory_snapshot]
 # Generated OverlayBD config dedicated to memory snapshot devices.
 # overlaybd_global_config_path = "$AENV_HOME/overlaybd/mem-overlaybd-global.json"

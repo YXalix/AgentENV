@@ -165,6 +165,72 @@ async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
     Ok(())
 }
 
+fn firecracker_rss_bytes(pid: i32) -> Result<u64> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
+    let rss_kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .context("VmRSS is missing")?
+        .parse::<u64>()?;
+    Ok(rss_kib * 1024)
+}
+
+#[tokio::test]
+#[ignore = "requires KVM, CAP_SYS_NICE, and active swap"]
+async fn v_pause_reclaims_memory_without_waiting_for_envd() -> Result<()> {
+    common::setup().await;
+    let mut sandbox = FirecrackerSandbox::new(common::default_sandbox_config()?)?;
+    sandbox.start_nowait().await?;
+    let pid = sandbox.firecracker_pid()?;
+    let running_rss = firecracker_rss_bytes(pid)?;
+
+    for _ in 0..50 {
+        sandbox.v_pause().await?;
+        let paused_rss = firecracker_rss_bytes(pid)?;
+        assert!(
+            paused_rss < running_rss,
+            "vPause should reduce RSS: running={running_rss}, paused={paused_rss}"
+        );
+        sandbox.v_resume().await?;
+    }
+    let snapshot = sandbox.pause().await?;
+    sandbox.stop().await?;
+    let mut resumed = FirecrackerSandbox::from_snapshot_config(&snapshot)?;
+    resumed.start_nowait().await?;
+    resumed.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires KVM, CAP_SYS_NICE, and active swap"]
+async fn v_pause_reclaims_memory_and_preserves_heavy_snapshot() -> Result<()> {
+    common::setup().await;
+    let mut sandbox = FirecrackerSandbox::new(common::default_sandbox_config()?)?;
+    sandbox.start().await?;
+    write_disk_marker(&mut sandbox).await?;
+    let pid = sandbox.firecracker_pid()?;
+    let running_rss = firecracker_rss_bytes(pid)?;
+
+    for _ in 0..3 {
+        sandbox.v_pause().await?;
+        let paused_rss = firecracker_rss_bytes(pid)?;
+        assert!(
+            paused_rss < running_rss,
+            "vPause should reduce RSS: running={running_rss}, paused={paused_rss}"
+        );
+        sandbox.v_resume().await?;
+        verify_disk_marker(&mut sandbox).await?;
+    }
+
+    let snapshot = sandbox.pause().await?;
+    sandbox.stop().await?;
+    let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
+    verify_disk_marker(&mut resumed).await?;
+    resumed.stop().await?;
+    Ok(())
+}
+
 async fn serve_tools_rootfs(
     rootfs: &Path,
 ) -> Result<(String, tokio::task::JoinHandle<std::io::Result<()>>)> {

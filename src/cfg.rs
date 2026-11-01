@@ -130,6 +130,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub memory_snapshot: MemorySnapshotConfig,
     #[config(nested)]
+    pub v_pause: VPauseConfig,
+    #[config(nested)]
     pub pool: PoolTomlConfig,
     #[config(nested)]
     pub p2p: P2pConfig,
@@ -555,6 +557,19 @@ pub enum OverlaybdCompressionAlgorithm {
     #[default]
     Lz4,
     Zstd,
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct VPauseConfig {
+    #[config(env = "AENV_V_PAUSE_ENABLED", default = false)]
+    pub enabled: bool,
+}
+
+impl VPauseConfig {
+    /// vPause only applies on KVM; PVM keeps the heavy-pause path.
+    pub fn effective(&self, mode: VirtualizationMode) -> bool {
+        self.enabled && matches!(mode, VirtualizationMode::Kvm)
+    }
 }
 
 #[derive(Debug, Config, Clone)]
@@ -1542,6 +1557,16 @@ mod tests {
         std::fs::write(&path, "[memory_snapshot]\ncompression_enabled = true\n")?;
         let config = ConfigManager::new_from_path(&path)?;
         assert!(config.config().memory_snapshot.compression_enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn v_pause_parses_when_enabled() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("v-pause.toml");
+        std::fs::write(&path, "[v_pause]\nenabled = true\n")?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert!(config.config().v_pause.enabled);
         Ok(())
     }
 
