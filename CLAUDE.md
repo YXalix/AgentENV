@@ -183,8 +183,11 @@ Reuse shared helpers: `src/local_store.rs` (`LocalKvStore`, explicit
 
 - **Lifecycle:** Recoverable capture/fork errors restore `Running`; terminal
   errors require teardown. With `[v_pause]` enabled, explicit Pause retains the
-  live VM and pages guest RAM to host swap without persisted state; timeout and
-  graceful shutdown resume it and then use persistent heavy-pause. vPause is not
+  live VM and queues guest-RAM pageout to host swap on the background worker
+  pool (`src/sandbox/firecracker/pageout.rs`) without persisted state — Pause
+  returns at vCPU stop, reclaim is best-effort, and resume/snapshot/teardown
+  cancel it; timeout and graceful shutdown resume it and then use persistent
+  heavy-pause. vPause is not
   crash-recoverable. Keep `CapturedSandboxSnapshot` alive until repository
   publication completes.
 - **Storage:** Commit logical layer references, not node-local paths. Cache GC

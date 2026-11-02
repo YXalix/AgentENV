@@ -187,6 +187,10 @@ async fn v_pause_reclaims_memory_without_waiting_for_envd() -> Result<()> {
 
     for _ in 0..50 {
         sandbox.v_pause().await?;
+        // Pageout is best-effort background work; settle it before asserting.
+        sandbox
+            .wait_for_v_pause_pageout(std::time::Duration::from_secs(120))
+            .await?;
         let paused_rss = firecracker_rss_bytes(pid)?;
         assert!(
             paused_rss < running_rss,
@@ -214,6 +218,10 @@ async fn v_pause_reclaims_memory_and_preserves_heavy_snapshot() -> Result<()> {
 
     for _ in 0..3 {
         sandbox.v_pause().await?;
+        // Pageout is best-effort background work; settle it before asserting.
+        sandbox
+            .wait_for_v_pause_pageout(std::time::Duration::from_secs(120))
+            .await?;
         let paused_rss = firecracker_rss_bytes(pid)?;
         assert!(
             paused_rss < running_rss,

@@ -11,6 +11,7 @@ mod factory;
 mod instance;
 mod mmds;
 mod overlaybd_snapshot;
+mod pageout;
 mod pool;
 mod process_vm_reader;
 mod sandbox;

@@ -1,7 +1,7 @@
+use anyhow::Context;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use anyhow::Context;
 
 const HOTPLUG_SCRIPT_CANDIDATES: &[&str] = &[
     "/lib/udev/ifupdown-hotplug",
@@ -65,7 +65,10 @@ fn ensure_dpkg_divert(script: &str) -> anyhow::Result<()> {
 /// has been moved.
 pub(super) fn patch_ifupdown_hotplug() -> anyhow::Result<()> {
     // 1) Locate the script that actually exists
-    let script = match HOTPLUG_SCRIPT_CANDIDATES.iter().find(|p| Path::new(p).exists()) {
+    let script = match HOTPLUG_SCRIPT_CANDIDATES
+        .iter()
+        .find(|p| Path::new(p).exists())
+    {
         Some(p) => *p,
         None => {
             eprintln!("[aenv-setup] ifupdown-hotplug not found, skip patch");
@@ -112,7 +115,9 @@ pub(super) fn patch_ifupdown_hotplug() -> anyhow::Result<()> {
     eprintln!("[aenv-setup] patched ifupdown-hotplug: {}", script);
 
     // 7) Reload udev rules (no --trigger, to avoid replaying events for all NICs)
-    let _ = Command::new("udevadm").args(["control", "--reload-rules"]).status();
+    let _ = Command::new("udevadm")
+        .args(["control", "--reload-rules"])
+        .status();
 
     Ok(())
 }

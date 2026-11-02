@@ -77,7 +77,13 @@ aenv download 018f0d93-aaaa-bbbb-cccc-0123456789ab /workspace/result.txt ./resul
 
 When `[v_pause].enabled = true` on a KVM node, explicit Pause stops the vCPUs
 and pages guest memory into host swap while keeping the same microVM
-process. Resume continues that process and faults memory back on demand; no
+process. Pause returns as soon as the vCPUs stop; the memory reclaim itself is
+best-effort and continues on a small pool of background pageout workers
+(`[v_pause].pageout_workers` threads, each advising one
+`[v_pause].pageout_chunk_mib` chunk of one sandbox per turn) so pausing
+thousands of sandboxes at once cannot stampede the host's swap subsystem.
+Resume cancels any remaining pageout (waiting at most one chunk) and continues
+that process, faulting memory back on demand; no
 snapshot is written. This live-vPause state is node-local and is not recovered
 from an abnormal server or host crash. Long-idle timeout and graceful shutdown
 instead capture persistent state and stop the microVM, so those sandboxes can be

@@ -557,14 +557,19 @@ make them through the TOML settings, not by editing the generated JSON.
 
 ## `[v_pause]`
 
-Lightweight in-process Pause for KVM sandboxes. Explicit Pause stops the vCPUs and uses `process_madvise(MADV_PAGEOUT)` on guest memory while retaining the Firecracker process. Resume is lazy and does not recreate the VM. Long-idle timeout and graceful shutdown first resume the VM, then use the persistent heavy-pause path. vPause is node-local and is not recovered after an abnormal server or host crash.
+Lightweight in-process Pause for KVM sandboxes. Explicit Pause stops the vCPUs and queues `process_madvise(MADV_PAGEOUT)` on guest memory for a pool of background workers while retaining the Firecracker process; the Pause call itself returns once the vCPUs stop, and reclaim completes asynchronously (best-effort). Resume is lazy, cancels any remaining pageout, and does not recreate the VM. Long-idle timeout and graceful shutdown first resume the VM, then use the persistent heavy-pause path. vPause is node-local and is not recovered after an abnormal server or host crash.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable vPause for explicit Pause requests. PVM continues to use heavy-pause. Enabling requires `CAP_SYS_NICE`. |
+| `pageout_workers` | usize | `8` | Background worker threads shared by all vPaused sandboxes. Bounds the number of concurrent `process_madvise(MADV_PAGEOUT)` streams regardless of how many sandboxes pause at once. Values below 1 are clamped to 1. |
+| `pageout_chunk_mib` | usize | `64` | Guest-memory bytes (MiB) one worker may advise per chunk. Also the cancellation granularity: Resume/snapshot wait at most one chunk for an in-flight chunk to finish. Values below 1 are clamped to 1. |
 
 vPause relies on host swap, provisioned and sized by the operator; without
 active swap, Pause stops the vCPUs but frees no host memory.
+`scripts/zram-swap-setup.sh` configures a multi-device zram swap tier suited
+to vPause's concurrent pageout traffic (teardown:
+`scripts/zram-swap-teardown.sh`).
 
 ## `[memory_snapshot]`
 
