@@ -668,6 +668,13 @@ impl FirecrackerInstance {
 /// the guest page size reported by Firecracker.
 const PAGEOUT_PAGE_SIZE: usize = 4096;
 
+/// The kernel imports iovecs through the read/write path, which silently
+/// clamps the length advised by one `process_madvise` call to `MAX_RW_COUNT`
+/// (`INT_MAX & PAGE_MASK`, just under 2 GiB) and returns the clamped count as
+/// success. Advise in chunks of at most this size so guest memory regions
+/// larger than 2 GiB are fully paged out.
+const MAX_ADVISE_CHUNK: usize = (i32::MAX as usize) & !(PAGEOUT_PAGE_SIZE - 1);
+
 fn pageout_regions(pidfd: RawFd, regions: &[GuestRegionUffdMapping]) -> Result<u64> {
     let mut advised = 0u64;
     for region in regions {
@@ -687,29 +694,39 @@ fn pageout_regions(pidfd: RawFd, regions: &[GuestRegionUffdMapping]) -> Result<u
             base % PAGEOUT_PAGE_SIZE == 0 && base.checked_add(len).is_some(),
             "guest memory region is invalid"
         );
-        let iovec = libc::iovec {
-            iov_base: base as *mut libc::c_void,
-            iov_len: len,
-        };
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_process_madvise,
-                pidfd,
-                &iovec,
-                1usize,
-                libc::MADV_PAGEOUT,
-                0u32,
-            )
-        };
-        if result < 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("page out guest memory region at {base:#x}"));
+        let mut region_advised = 0usize;
+        while region_advised < len {
+            let chunk = (len - region_advised).min(MAX_ADVISE_CHUNK);
+            let iovec = libc::iovec {
+                iov_base: (base + region_advised) as *mut libc::c_void,
+                iov_len: chunk,
+            };
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_process_madvise,
+                    pidfd,
+                    &iovec,
+                    1usize,
+                    libc::MADV_PAGEOUT,
+                    0u32,
+                )
+            };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!(
+                        "page out guest memory region at {:#x}",
+                        base + region_advised
+                    )
+                });
+            }
+            anyhow::ensure!(
+                result > 0,
+                "guest memory pageout made no progress at {:#x}",
+                base + region_advised
+            );
+            region_advised += result as usize;
         }
-        anyhow::ensure!(
-            result == len as i64,
-            "partial guest memory pageout at {base:#x}: {result} of {len} bytes"
-        );
-        advised += result as u64;
+        advised += region_advised as u64;
     }
     Ok(advised)
 }
@@ -923,6 +940,41 @@ mod tests {
         // A Firecracker without fdp: support treats the whole string as an
         // interface name and fails loudly instead of silently mis-parsing.
         assert_eq!(tap.host_dev_name(), "fdp:3:tap0");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SYS_NICE and active swap"]
+    fn pageout_regions_advise_regions_larger_than_max_rw_count() -> Result<()> {
+        // One page past the per-syscall clamp: a single process_madvise call
+        // silently advises only MAX_ADVISE_CHUNK bytes.
+        let len = MAX_ADVISE_CHUNK + PAGEOUT_PAGE_SIZE;
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        anyhow::ensure!(base != libc::MAP_FAILED, "mmap failed");
+        // Touch sparsely so reclaim stays fast while covering both chunks.
+        let touched: Vec<usize> = (0..len).step_by(2 * 1024 * 1024).collect();
+        for &offset in &touched {
+            unsafe { base.cast::<u8>().add(offset).write(0x5a) };
+        }
+        let pid = rustix::process::Pid::from_raw(std::process::id() as i32).unwrap();
+        let pidfd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())?;
+        let region = GuestRegionUffdMapping::new(base as i64, len as i64, 0, 4096);
+        let result = pageout_regions(pidfd.as_raw_fd(), &[region]);
+        let preserved = touched
+            .iter()
+            .all(|&offset| unsafe { base.cast::<u8>().add(offset).read() } == 0x5a);
+        unsafe { libc::munmap(base, len) };
+        assert!(preserved);
+        assert_eq!(result?, len as u64);
         Ok(())
     }
 
