@@ -33,6 +33,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_V_PAUSE_ENABLED` | `false` | Enable in-process vPause for explicit Pause requests on KVM nodes. |
 | `AENV_V_PAUSE_PAGEOUT_WORKERS` | `8` | Background pageout worker threads shared by all vPaused sandboxes. |
 | `AENV_V_PAUSE_PAGEOUT_CHUNK_MIB` | `64` | Guest-memory MiB one worker may advise per chunk; also the cancellation granularity. |
+| `AENV_V_PAUSE_STOP_VCPUS` | `true` | Stop (pause) the vCPUs during vPause. When `false`, the vCPUs keep running and vPause only queues guest-memory pageout. |
 | `AENV_SNAPSHOT_LOCAL_CACHE_PATH` | `$AENV_HOME/snapshot-local-cache` | Override the snapshot manager's node-local artifact/cache root |
 | `AENV_SNAPSHOT_STORE` | `$AENV_HOME/snapshot-store` | Override the posix_fs snapshot repository root directory |
 | `AENV_UBLK_DAEMON_BINARY_PATH` | `$AENV_HOME/ublk/uvm-ublk-daemon` | Override path to the `uvm-ublk-daemon` binary |

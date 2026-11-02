@@ -1,7 +1,8 @@
 //! Best-effort background pageout for vPaused sandboxes.
 //!
-//! `v_pause` stops the guest vCPUs immediately and hands the guest-memory
-//! pageout to this module instead of performing it synchronously: thousands
+//! `v_pause` stops the guest vCPUs immediately (unless `[v_pause].stop_vcpus`
+//! keeps them running) and hands the guest-memory pageout to this module
+//! instead of performing it synchronously: thousands
 //! of concurrent pauses would otherwise funnel every
 //! `process_madvise(MADV_PAGEOUT)` call into the host swap subsystem at the
 //! same instant, and the burst serializes the whole machine on swap-slot and
