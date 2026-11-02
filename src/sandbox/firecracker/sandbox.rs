@@ -177,6 +177,12 @@ pub struct FirecrackerSandbox {
     fc_instance: FirecrackerInstance,
     runtime_policy: FirecrackerRuntimePolicy,
     v_paused: bool,
+    /// The Firecracker VM is currently in the Paused state because of a
+    /// vPause or snapshot pause on this backend. Distinguishes the actual
+    /// vCPU stop from `v_paused`, which also covers pageout-only vPause
+    /// (`[v_pause].stop_vcpus = false`) where the VM keeps running.
+    /// Invariant: `vcpus_stopped` implies `v_paused`.
+    vcpus_stopped: bool,
     /// Background pageout lifecycle for vPause: `v_pause` submits a job here,
     /// resume/snapshot/teardown cancel it. The pool is process-global.
     pageout: Arc<PageoutControl>,
@@ -388,12 +394,17 @@ impl SandboxBackend for FirecrackerSandbox {
         if self.v_paused {
             return Ok(());
         }
-        self.fc_instance.pause().await?;
+        // `[v_pause].stop_vcpus = false` keeps the vCPUs running: vPause then
+        // only queues the pageout below, opportunistically reclaiming idle
+        // guest pages while the workload continues.
+        if ConfigManager::global_config().v_pause.stop_vcpus {
+            self.fc_instance.pause().await?;
+            self.vcpus_stopped = true;
+        }
         self.v_paused = true;
         // Memory reclaim is best-effort on the background pageout pool: the
-        // sandbox is paused the moment the vCPUs stop, and the workers drain
-        // guest memory to swap over time. Failing to even queue the job keeps
-        // the sandbox paused with resident memory.
+        // workers drain guest memory to swap over time. Failing to even queue
+        // the job keeps the sandbox paused with resident memory.
         match self.fc_instance.guest_memory_pageout_targets().await {
             Ok((pidfd, regions)) => {
                 PageoutControl::spawn_job(Arc::clone(&self.pageout), self.id, pidfd, regions);
@@ -415,7 +426,11 @@ impl SandboxBackend for FirecrackerSandbox {
             return Ok(());
         }
         self.pageout.cancel_and_drain().await;
-        self.fc_instance.resume().await?;
+        // Nothing to resume when the vCPUs kept running (pageout-only vPause).
+        if self.vcpus_stopped {
+            self.fc_instance.resume().await?;
+            self.vcpus_stopped = false;
+        }
         self.v_paused = false;
         Ok(())
     }
@@ -1208,8 +1223,12 @@ impl FirecrackerSandbox {
                 .context("cannot flush writable volumes because envd is not running")?;
             Self::sync_writable_volume_filesystems(envd).await?;
         }
-        if !self.v_paused {
+        // The snapshot reads all guest memory, so the VM itself must be
+        // stopped — pageout-only vPause (`v_paused` with running vCPUs)
+        // included.
+        if !self.vcpus_stopped {
             self.fc_instance.pause().await?;
+            self.vcpus_stopped = true;
             self.v_paused = true;
         }
 
@@ -1425,6 +1444,7 @@ impl FirecrackerSandbox {
         debug!("resuming paused sandbox in-place");
         self.pageout.cancel();
         self.fc_instance.resume().await?;
+        self.vcpus_stopped = false;
         self.v_paused = false;
         Ok(())
     }
@@ -1798,6 +1818,7 @@ impl FirecrackerSandbox {
             work_dir,
             fc_instance,
             v_paused: false,
+            vcpus_stopped: false,
             pageout: Arc::new(PageoutControl::new()),
             network_slot: None,
             current_network_policy,

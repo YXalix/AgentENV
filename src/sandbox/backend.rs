@@ -230,8 +230,10 @@ pub trait SandboxBackend: Send + 'static {
 
     /// Pause the VM in place and reclaim its guest memory without capturing state.
     ///
-    /// Returns once the vCPUs stop; reclaiming guest memory (pageout to host
-    /// swap) is best-effort and continues in the background afterward.
+    /// Returns once the vCPUs stop (or once pageout is queued when
+    /// `[v_pause].stop_vcpus` keeps the vCPUs running); reclaiming guest memory
+    /// (pageout to host swap) is best-effort and continues in the background
+    /// afterward.
     async fn v_pause(&mut self) -> Result<()>;
 
     /// Resume a VM paused by [`Self::v_pause`].

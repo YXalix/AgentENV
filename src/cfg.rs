@@ -573,6 +573,11 @@ pub struct VPauseConfig {
     /// granularity of cancellation: `vResume` waits at most one chunk.
     #[config(env = "AENV_V_PAUSE_PAGEOUT_CHUNK_MIB", default = 64usize)]
     pub pageout_chunk_mib: usize,
+    /// Stop (pause) the vCPUs during vPause. When false, the vCPUs keep
+    /// running and vPause only queues guest-memory pageout, opportunistically
+    /// reclaiming idle guest pages to host swap.
+    #[config(env = "AENV_V_PAUSE_STOP_VCPUS", default = true)]
+    pub stop_vcpus: bool,
 }
 
 impl VPauseConfig {
@@ -799,6 +804,7 @@ impl_config_default!(
     OrchestratorConfig,
     P2pConfig,
     CustomExtensionConfig,
+    VPauseConfig,
 );
 
 impl AppConfig {
@@ -1577,6 +1583,22 @@ mod tests {
         std::fs::write(&path, "[v_pause]\nenabled = true\n")?;
         let config = ConfigManager::new_from_path(&path)?;
         assert!(config.config().v_pause.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn v_pause_stop_vcpus_defaults_to_true_and_parses() -> Result<()> {
+        assert!(VPauseConfig::default().stop_vcpus);
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        assert!(config.config().v_pause.stop_vcpus);
+
+        let temp = tempdir()?;
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "[v_pause]\nstop_vcpus = false\n")?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert!(!config.config().v_pause.stop_vcpus);
         Ok(())
     }
 
