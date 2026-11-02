@@ -25,7 +25,7 @@
 # Defaults: 4 devices per NUMA node x 8192 MiB each, lz4, priority 100.
 # Budget = per-node count x nodes x size (e.g. 4 nodes -> 16 devices -> 128 GiB).
 #
-# Cleanup: scripts/zram-swap-teardown.sh
+# Cleanup: scripts/zram-swap-teardown.sh (--remove also deletes the devices)
 
 set -euo pipefail
 
@@ -112,6 +112,19 @@ fi
 # 3. Create and activate the devices
 # ---------------------------------------------------------------------------
 # Reuses already-idle /dev/zram[0..] devices and hot-adds any extras needed.
+# An idle device can still be initialized (disksize left set by an aborted run
+# or a manual experiment); comp_algorithm/disksize then reject writes with
+# EBUSY, so reset such leftovers before configuring.
+
+# zram sysfs writes fail with a bare "write error" while a device is not
+# resettable or is held open; name the file and the likely cause instead.
+sys_write() {
+    if ! printf '%s' "$2" > "$1"; then
+        echo "error: writing $1 failed (is the device initialized or held open?)" >&2
+        exit 1
+    fi
+}
+
 created=0
 index=0
 while [[ $created -lt $WANT ]]; do
@@ -130,8 +143,12 @@ while [[ $created -lt $WANT ]]; do
         index=$((index + 1))
         continue
     fi
-    echo "$ALGORITHM" > "/sys/block/$disk/comp_algorithm"
-    echo "$((SIZE_MIB * 1024 * 1024))" > "/sys/block/$disk/disksize"
+    if [[ "$(cat "/sys/block/$disk/disksize")" -ne 0 ]]; then
+        echo "zram: resetting leftover-initialized $disk"
+        sys_write "/sys/block/$disk/reset" 1
+    fi
+    sys_write "/sys/block/$disk/comp_algorithm" "$ALGORITHM"
+    sys_write "/sys/block/$disk/disksize" "$((SIZE_MIB * 1024 * 1024))"
     mkswap "$dev" > /dev/null
     swapon -p "$PRIORITY" "$dev"
     echo "zram: activated $dev ($SIZE_MIB MiB, $ALGORITHM, priority $PRIORITY)"
