@@ -370,6 +370,11 @@ fill_concurrency = 4
 # Requires operator-provided swap; without it, Pause stops vCPUs but frees no memory.
 # Long-idle timeout and graceful shutdown still capture a persistent heavy snapshot.
 enabled = false
+# Background worker threads serving vPause pageout across all sandboxes; bounds
+# concurrent process_madvise(MADV_PAGEOUT) streams.
+pageout_workers = 8
+# MiB advised per worker chunk; also the cancellation granularity on resume.
+pageout_chunk_mib = 64
 
 [memory_snapshot]
 # Generated OverlayBD config dedicated to memory snapshot devices.

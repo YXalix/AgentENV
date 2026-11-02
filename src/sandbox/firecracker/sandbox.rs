@@ -21,6 +21,7 @@ use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
     restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
 };
+use super::pageout::PageoutControl;
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::{FirecrackerInstance, SANDBOX_NET_IFACE_ID, SANDBOX_TAP_IFACE_NAME};
 use crate::sandbox::custom_extension::{
@@ -176,6 +177,9 @@ pub struct FirecrackerSandbox {
     fc_instance: FirecrackerInstance,
     runtime_policy: FirecrackerRuntimePolicy,
     v_paused: bool,
+    /// Background pageout lifecycle for vPause: `v_pause` submits a job here,
+    /// resume/snapshot/teardown cancel it. The pool is process-global.
+    pageout: Arc<PageoutControl>,
     network_slot: Option<Slot>,
     current_network_policy: Option<SandboxNetworkPolicy>,
     /// Current custom extension params. Initialized from the launch config and
@@ -386,29 +390,31 @@ impl SandboxBackend for FirecrackerSandbox {
         }
         self.fc_instance.pause().await?;
         self.v_paused = true;
-        match self.fc_instance.pageout_guest_memory().await {
-            Ok(bytes) => {
-                metrics::counter!("agentenv_v_pause_pageout_advised_bytes_total").increment(bytes);
-                debug!(bytes, "guest memory pageout advised for vPause");
-                Ok(())
+        // Memory reclaim is best-effort on the background pageout pool: the
+        // sandbox is paused the moment the vCPUs stop, and the workers drain
+        // guest memory to swap over time. Failing to even queue the job keeps
+        // the sandbox paused with resident memory.
+        match self.fc_instance.guest_memory_pageout_targets().await {
+            Ok((pidfd, regions)) => {
+                PageoutControl::spawn_job(Arc::clone(&self.pageout), self.id, pidfd, regions);
             }
             Err(error) => {
                 metrics::counter!("agentenv_v_pause_pageout_failures_total").increment(1);
-                if let Err(resume_error) = self.fc_instance.resume().await {
-                    return Err(error.context(format!(
-                        "failed to page out guest memory and resume sandbox: {resume_error:#}"
-                    )));
-                }
-                self.v_paused = false;
-                Err(error.context("failed to page out guest memory; sandbox resumed"))
+                warn!(
+                    sandbox_id = %self.id,
+                    error = %error,
+                    "failed to queue guest memory pageout; sandbox stays paused with resident memory"
+                );
             }
         }
+        Ok(())
     }
 
     async fn v_resume(&mut self) -> Result<()> {
         if !self.v_paused {
             return Ok(());
         }
+        self.pageout.cancel_and_drain().await;
         self.fc_instance.resume().await?;
         self.v_paused = false;
         Ok(())
@@ -1189,6 +1195,11 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
+        // The snapshot reads all guest memory; stop the background pageout
+        // first so the two do not push pages back and forth.
+        if self.v_paused {
+            self.pageout.cancel_and_drain().await;
+        }
         if self.has_writable_persistent_volumes() {
             self.v_resume().await?;
             let envd = self
@@ -1399,11 +1410,20 @@ impl FirecrackerSandbox {
         .context("convert dirty memory ranges to overlaybd layer")
     }
 
+    /// Waits until this sandbox's background vPause pageout settles
+    /// (completed, failed, or cancelled). Primarily for tests and
+    /// diagnostics; production flows rely on best-effort semantics or the
+    /// drain built into `v_resume`.
+    pub async fn wait_for_v_pause_pageout(&self, timeout: std::time::Duration) -> Result<()> {
+        self.pageout.wait_until_settled(timeout).await
+    }
+
     /// Resume a paused sandbox in-place.
     ///
     /// Use this when you want to keep the same sandbox instance.
     pub async fn resume(&mut self) -> Result<()> {
         debug!("resuming paused sandbox in-place");
+        self.pageout.cancel();
         self.fc_instance.resume().await?;
         self.v_paused = false;
         Ok(())
@@ -1425,6 +1445,11 @@ impl FirecrackerSandbox {
     #[tracing::instrument(skip(self))]
     pub async fn stop(&mut self) -> Result<()> {
         debug!("stopping firecracker sandbox");
+
+        // The Firecracker process is going away; stop queueing new pageout
+        // chunks against it (an in-flight chunk observes the dead pidfd and
+        // drops the job).
+        self.pageout.cancel();
 
         self.fc_instance
             .stop(self.runtime_policy.socket_timeout)
@@ -1725,6 +1750,7 @@ fn relocate_warm_log(src: Option<&Path>, target: &Path) -> Result<()> {
 /// since proper delete (via the daemon) was not performed.
 impl Drop for FirecrackerSandbox {
     fn drop(&mut self) {
+        self.pageout.cancel();
         if let Some(envd) = self.envd_instance.as_ref() {
             envd.invalidate();
         }
@@ -1772,6 +1798,7 @@ impl FirecrackerSandbox {
             work_dir,
             fc_instance,
             v_paused: false,
+            pageout: Arc::new(PageoutControl::new()),
             network_slot: None,
             current_network_policy,
             current_custom_extension_params,

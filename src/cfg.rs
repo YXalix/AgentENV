@@ -563,6 +563,16 @@ pub enum OverlaybdCompressionAlgorithm {
 pub struct VPauseConfig {
     #[config(env = "AENV_V_PAUSE_ENABLED", default = false)]
     pub enabled: bool,
+    /// Background worker threads shared by all vPaused sandboxes. Each worker
+    /// advises one chunk of one sandbox per turn, so this bounds the number
+    /// of concurrent `process_madvise(MADV_PAGEOUT)` streams regardless of
+    /// how many sandboxes pause at once.
+    #[config(env = "AENV_V_PAUSE_PAGEOUT_WORKERS", default = 8usize)]
+    pub pageout_workers: usize,
+    /// Guest-memory bytes (MiB) one worker may advise per chunk. Also the
+    /// granularity of cancellation: `vResume` waits at most one chunk.
+    #[config(env = "AENV_V_PAUSE_PAGEOUT_CHUNK_MIB", default = 64usize)]
+    pub pageout_chunk_mib: usize,
 }
 
 impl VPauseConfig {
