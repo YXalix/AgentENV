@@ -425,7 +425,10 @@ impl SandboxBackend for FirecrackerSandbox {
         if !self.v_paused {
             return Ok(());
         }
-        self.pageout.cancel_and_drain().await;
+        // Cancel without waiting: a chunk racing the resumed guest is wasted
+        // reclaim, never corruption (see pageout module docs); only the
+        // snapshot path drains.
+        self.pageout.cancel();
         // Nothing to resume when the vCPUs kept running (pageout-only vPause).
         if self.vcpus_stopped {
             self.fc_instance.resume().await?;

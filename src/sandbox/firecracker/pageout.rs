@@ -12,11 +12,12 @@
 //! one sandbox and advises at most one chunk of guest memory per turn before
 //! re-enqueueing itself, so pending sandboxes advance in round-robin order
 //! and no large guest starves the rest. A job carries its own pidfd and
-//! region list, so workers never hold sandbox locks. `v_resume`, teardown,
-//! and snapshot paths only bump the owning [`PageoutControl`] generation; the
-//! worker notices at the next chunk boundary and drops the job. An in-flight
-//! chunk cannot be preempted, so draining waits at most one chunk (bounded by
-//! `pageout_chunk_mib`).
+//! region list, so workers never hold sandbox locks. `v_resume` and teardown
+//! only bump the owning [`PageoutControl`] generation; the worker notices at
+//! the next chunk boundary and drops the job, leaving an in-flight chunk to
+//! race the resumed guest (safe: MADV_PAGEOUT on a running process is
+//! ordinary kernel reclaim — wasteful, never corrupting). Only the snapshot
+//! path drains the in-flight chunk, which is bounded by `pageout_chunk_mib`.
 
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -105,8 +106,9 @@ impl PageoutControl {
         }
     }
 
-    /// Cancels, then waits for an in-flight chunk to finish so the caller can
-    /// safely snapshot or resume the guest.
+    /// Cancels, then waits for an in-flight chunk to finish. Only the
+    /// snapshot path needs the wait; see the module docs for why resume and
+    /// teardown cancel without one.
     pub(crate) async fn cancel_and_drain(&self) {
         self.cancel();
         let deadline = Instant::now() + DRAIN_TIMEOUT;
