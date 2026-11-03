@@ -570,7 +570,7 @@ pub struct VPauseConfig {
     #[config(env = "AENV_V_PAUSE_PAGEOUT_WORKERS", default = 8usize)]
     pub pageout_workers: usize,
     /// Guest-memory bytes (MiB) one worker may advise per chunk. Also the
-    /// granularity of cancellation: `vResume` waits at most one chunk.
+    /// granularity of cancellation: snapshot capture waits at most one chunk.
     #[config(env = "AENV_V_PAUSE_PAGEOUT_CHUNK_MIB", default = 64usize)]
     pub pageout_chunk_mib: usize,
     /// Stop (pause) the vCPUs during vPause. When false, the vCPUs keep

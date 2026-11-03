@@ -373,7 +373,8 @@ enabled = false
 # Background worker threads serving vPause pageout across all sandboxes; bounds
 # concurrent process_madvise(MADV_PAGEOUT) streams.
 pageout_workers = 8
-# MiB advised per worker chunk; also the cancellation granularity on resume.
+# MiB advised per worker chunk; also the cancellation granularity on snapshot
+# capture.
 pageout_chunk_mib = 64
 # Stop (pause) the vCPUs during vPause. When false, the vCPUs keep running and
 # vPause only queues guest-memory pageout, opportunistically reclaiming idle

@@ -563,7 +563,7 @@ Lightweight in-process Pause for KVM sandboxes. Explicit Pause stops the vCPUs a
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable vPause for explicit Pause requests. PVM continues to use heavy-pause. Enabling requires `CAP_SYS_NICE`. |
 | `pageout_workers` | usize | `8` | Background worker threads shared by all vPaused sandboxes. Bounds the number of concurrent `process_madvise(MADV_PAGEOUT)` streams regardless of how many sandboxes pause at once. Values below 1 are clamped to 1. |
-| `pageout_chunk_mib` | usize | `64` | Guest-memory bytes (MiB) one worker may advise per chunk. Also the cancellation granularity: Resume/snapshot wait at most one chunk for an in-flight chunk to finish. Values below 1 are clamped to 1. |
+| `pageout_chunk_mib` | usize | `64` | Guest-memory bytes (MiB) one worker may advise per chunk. Also the cancellation granularity: snapshot capture waits at most one chunk for an in-flight chunk to finish; resume and teardown cancel without waiting. Values below 1 are clamped to 1. |
 | `stop_vcpus` | bool | `true` | Stop (pause) the vCPUs during vPause. When `false`, the vCPUs keep running and vPause only queues guest-memory pageout, opportunistically reclaiming idle guest pages to host swap; timeout and graceful shutdown still stop the VM before capturing a persistent snapshot. |
 
 vPause relies on host swap, provisioned and sized by the operator; without
