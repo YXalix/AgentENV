@@ -570,7 +570,11 @@ vPause relies on host swap, provisioned and sized by the operator; without
 active swap, Pause stops the vCPUs but frees no host memory.
 `scripts/zram-swap-setup.sh` configures a multi-device zram swap tier suited
 to vPause's concurrent pageout traffic (teardown:
-`scripts/zram-swap-teardown.sh`).
+`scripts/zram-swap-teardown.sh`). `scripts/swapfile-swap-setup.sh` adds a
+disk swapfile tier: the zram tier's priority joins the same per-NUMA
+rotation to shard the per-area swap locks further, a lower priority
+overflows when the zram tier fills (teardown:
+`scripts/swapfile-swap-teardown.sh`).
 
 ### Telemetry
 
