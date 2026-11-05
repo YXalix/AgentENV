@@ -572,6 +572,35 @@ active swap, Pause stops the vCPUs but frees no host memory.
 to vPause's concurrent pageout traffic (teardown:
 `scripts/zram-swap-teardown.sh`).
 
+### Telemetry
+
+Pageout behavior is exported on the node `/metrics` endpoint for capacity and
+tuning analysis:
+
+- Latency: `agentenv_sandbox_stage_duration_seconds{operation="v_pause"}`
+  covers the synchronous part of Pause (`stage="vcpu_stop"`,
+  `stage="dirty_window_query"`, `stage="guest_regions_fetch"`); the background
+  drain is covered by `agentenv_v_pause_pageout_queue_wait_seconds` (enqueue to
+  first pickup), `agentenv_v_pause_pageout_chunk_duration_seconds` (one
+  `process_madvise` turn, labeled by `status`), and
+  `agentenv_v_pause_pageout_job_duration_seconds` (enqueue to completion).
+- Selection quality: `agentenv_v_pause_pageout_target_bytes_total` and
+  `agentenv_v_pause_pageout_target_regions_total` (labeled `path="dirty"` or
+  `"full"`) record the victim set handed to the workers; compare their rate
+  with `agentenv_v_pause_pageout_advised_bytes_total` to see how much of the
+  target was actually advised.
+- Effect: `agentenv_v_pause_pageout_process_rss_bytes` (labeled
+  `phase="before"`/`"after"`) samples the Firecracker process resident set at
+  submit and completion, and `agentenv_v_pause_pageout_rss_reclaimed_bytes_total`
+  accumulates the difference — the host memory vPause actually freed.
+- Scheduling: `agentenv_v_pause_pageout_requeue_rounds_total` counts
+  round-robin re-enqueues (dividing by
+  `agentenv_v_pause_pageout_completions_total` gives the average turns per
+  job, a signal for tuning `pageout_chunk_mib` and `pageout_workers`);
+  `agentenv_v_pause_pageout_paths_total{path,reason}` accounts for skipped and
+  full-region fallback runs (`tracking_disabled`, `query_failed`,
+  `ranges_unusable`, `regions_fetch_failed`, `empty_window`).
+
 ## `[memory_snapshot]`
 
 Memory snapshot overlaybd configuration. The server auto-generates the file at

@@ -15,17 +15,34 @@ const DURATION_BUCKETS: &[f64] = &[
     120.0, 300.0, 600.0, 900.0, 1200.0, 1800.0,
 ];
 
-/// Fine-grained buckets for the two sampled ZFile read-path duration
-/// histograms: 1µs..500µs in 1/2/5 steps, then the standard
+/// Fine-grained buckets for sub-millisecond-scale duration histograms (the
+/// sampled ZFile read path and the vPause pageout chunk/queue-wait
+/// histograms): 1µs..500µs in 1/2/5 steps, then the standard
 /// `DURATION_BUCKETS` ladder from 1ms to 30s. Values are seconds, strictly
 /// increasing; the exporter appends the implicit `+Inf` bucket itself.
-/// Attached only to the two exact metric names in
+/// Attached only to their exact metric names in
 /// [`init_prometheus_recorder`] via [`Matcher::Full`], so every other (and
 /// any future) histogram keeps `DURATION_BUCKETS`.
-const ZFILE_FINE_DURATION_BUCKETS: &[f64] = &[
+const FINE_DURATION_BUCKETS: &[f64] = &[
     0.000_001, 0.000_002, 0.000_005, 0.000_010, 0.000_025, 0.000_050, 0.000_100, 0.000_250,
     0.000_500, 0.001, 0.002, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0,
     30.0,
+];
+
+/// Byte-scale buckets for the vPause resident-set histogram: 256 MiB ..
+/// 128 GiB in doubling steps, so the default duration ladder (1 ms..1800 s)
+/// is not applied to byte values.
+const MEMORY_SIZE_BUCKETS: &[f64] = &[
+    268_435_456.0,
+    536_870_912.0,
+    1_073_741_824.0,
+    2_147_483_648.0,
+    4_294_967_296.0,
+    8_589_934_592.0,
+    17_179_869_184.0,
+    34_359_738_368.0,
+    68_719_476_736.0,
+    137_438_953_472.0,
 ];
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
@@ -40,15 +57,28 @@ pub fn init_prometheus_recorder() -> anyhow::Result<()> {
     let handle = PrometheusBuilder::new()
         .set_buckets(DURATION_BUCKETS)?
         // Per-metric overrides take precedence over the global buckets
-        // above (full match beats the default); both ZFile histograms share
-        // the same microsecond-resolution bucket set.
+        // above (full match beats the default); the ZFile and vPause pageout
+        // duration histograms share the same microsecond-resolution bucket
+        // set.
         .set_buckets_for_metric(
             Matcher::Full("agentenv_overlaybd_zfile_pread_duration_seconds".to_owned()),
-            ZFILE_FINE_DURATION_BUCKETS,
+            FINE_DURATION_BUCKETS,
         )?
         .set_buckets_for_metric(
             Matcher::Full("agentenv_overlaybd_zfile_decompress_duration_seconds".to_owned()),
-            ZFILE_FINE_DURATION_BUCKETS,
+            FINE_DURATION_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("agentenv_v_pause_pageout_chunk_duration_seconds".to_owned()),
+            FINE_DURATION_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("agentenv_v_pause_pageout_queue_wait_seconds".to_owned()),
+            FINE_DURATION_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("agentenv_v_pause_pageout_process_rss_bytes".to_owned()),
+            MEMORY_SIZE_BUCKETS,
         )?
         .install_recorder()?;
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {

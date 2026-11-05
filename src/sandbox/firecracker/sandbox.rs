@@ -31,6 +31,7 @@ use crate::sandbox::custom_extension::{
 use crate::sandbox::manifest::SandboxSnapshotManifest;
 
 use crate::cfg::ConfigManager;
+use crate::observability::prometheus::SandboxStageTimer;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
     CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
@@ -406,14 +407,19 @@ impl SandboxBackend for FirecrackerSandbox {
         if self.v_paused {
             return Ok(());
         }
+        let stage_timer = SandboxStageTimer::new("v_pause");
         // `[v_pause].stop_vcpus = false` keeps the vCPUs running: vPause then
         // only queues the pageout below, opportunistically reclaiming idle
         // guest pages while the workload continues.
         if ConfigManager::global_config().v_pause.stop_vcpus {
-            self.fc_instance.pause().await?;
+            stage_timer
+                .time("vcpu_stop", self.fc_instance.pause())
+                .await?;
             self.vcpus_stopped = true;
         }
         self.v_paused = true;
+        // The pid feeds the resident-set telemetry of the background pageout.
+        let pid = self.fc_instance.pid().ok().map(|pid| pid.as_raw());
         // Memory reclaim is best-effort on the background pageout pool: the
         // workers drain guest memory to swap over time. Failing to even queue
         // the job keeps the sandbox paused with resident memory.
@@ -424,21 +430,37 @@ impl SandboxBackend for FirecrackerSandbox {
                     PageoutControl::spawn_job(
                         Arc::clone(&self.pageout),
                         self.id,
+                        pid,
                         pidfd,
                         dirty_regions,
+                        "dirty",
                     );
                 }
                 PageoutTargets::FullRegions => {
-                    match self.fc_instance.guest_memory_regions().await {
+                    match stage_timer
+                        .time(
+                            "guest_regions_fetch",
+                            self.fc_instance.guest_memory_regions(),
+                        )
+                        .await
+                    {
                         Ok(regions) => {
                             PageoutControl::spawn_job(
                                 Arc::clone(&self.pageout),
                                 self.id,
+                                pid,
                                 pidfd,
                                 regions,
+                                "full",
                             );
                         }
                         Err(error) => {
+                            metrics::counter!(
+                                "agentenv_v_pause_pageout_paths_total",
+                                "path" => "full",
+                                "reason" => "regions_fetch_failed",
+                            )
+                            .increment(1);
                             metrics::counter!("agentenv_v_pause_pageout_failures_total")
                                 .increment(1);
                             warn!(
@@ -753,9 +775,22 @@ impl FirecrackerSandbox {
             .memory_snapshot
             .track_dirty_pages
         {
+            metrics::counter!(
+                "agentenv_v_pause_pageout_paths_total",
+                "path" => "full",
+                "reason" => "tracking_disabled",
+            )
+            .increment(1);
             return PageoutTargets::FullRegions;
         }
-        match self.fc_instance.get_dirty_window_ranges().await {
+        let stage_timer = SandboxStageTimer::new("v_pause");
+        match stage_timer
+            .time(
+                "dirty_window_query",
+                self.fc_instance.get_dirty_window_ranges(),
+            )
+            .await
+        {
             Ok(ranges) => {
                 let window_bytes =
                     u64::try_from(ranges.dirty_ranges.iter().map(|r| r.length).sum::<i64>())
@@ -776,8 +811,22 @@ impl FirecrackerSandbox {
                 }
                 match pageout_regions_from_dirty(&ranges) {
                     Ok(Some(regions)) => PageoutTargets::DirtyWindow(regions),
-                    Ok(None) => PageoutTargets::Skip,
+                    Ok(None) => {
+                        metrics::counter!(
+                            "agentenv_v_pause_pageout_paths_total",
+                            "path" => "skip",
+                            "reason" => "empty_window",
+                        )
+                        .increment(1);
+                        PageoutTargets::Skip
+                    }
                     Err(error) => {
+                        metrics::counter!(
+                            "agentenv_v_pause_pageout_paths_total",
+                            "path" => "full",
+                            "reason" => "ranges_unusable",
+                        )
+                        .increment(1);
                         warn!(
                             sandbox_id = %self.id,
                             error = %error,
@@ -788,6 +837,12 @@ impl FirecrackerSandbox {
                 }
             }
             Err(error) => {
+                metrics::counter!(
+                    "agentenv_v_pause_pageout_paths_total",
+                    "path" => "full",
+                    "reason" => "query_failed",
+                )
+                .increment(1);
                 warn!(
                     sandbox_id = %self.id,
                     error = %error,

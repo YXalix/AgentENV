@@ -44,6 +44,7 @@ use anyhow::{ensure, Context, Result};
 use firecracker_client::models::{DirtyMemoryRange, DirtyMemoryRanges, GuestRegionUffdMapping};
 use tracing::{debug, warn};
 
+use crate::observability::prometheus::result_status;
 use crate::privileges::{run_with_scoped_capabilities, CAP_SYS_NICE};
 use crate::types::SandboxId;
 
@@ -92,23 +93,46 @@ impl PageoutControl {
     }
 
     /// Enqueues a best-effort pageout of `pidfd`'s guest memory `regions`,
-    /// superseding any job still queued for this sandbox.
+    /// superseding any job still queued for this sandbox. `pid` feeds the
+    /// resident-set telemetry only and `path` labels where the victim list
+    /// came from (`dirty` or `full`).
     pub(crate) fn spawn_job(
         control: Arc<Self>,
         sandbox_id: SandboxId,
+        pid: Option<i32>,
         pidfd: OwnedFd,
         regions: Vec<GuestRegionUffdMapping>,
+        path: &'static str,
     ) {
         let job_id = control.current_job.fetch_add(1, Ordering::SeqCst) + 1;
         control.pending.store(true, Ordering::SeqCst);
+        let target_bytes: u64 = regions
+            .iter()
+            .map(|region| u64::try_from(region.size).unwrap_or(0))
+            .sum();
+        if target_bytes > 0 {
+            metrics::counter!("agentenv_v_pause_pageout_target_bytes_total", "path" => path)
+                .increment(target_bytes);
+        }
+        metrics::counter!("agentenv_v_pause_pageout_target_regions_total", "path" => path)
+            .increment(regions.len() as u64);
+        let rss_before = pid.and_then(process_rss_bytes);
+        if let Some(rss) = rss_before {
+            metrics::histogram!("agentenv_v_pause_pageout_process_rss_bytes", "phase" => "before")
+                .record(rss as f64);
+        }
         PAGEOUT_QUEUE.enqueue(PageoutJob {
             id: job_id,
             sandbox_id,
+            pid,
             pidfd,
             regions,
             cursor: PageoutCursor::default(),
             chunk_bytes: pageout_chunk_bytes(),
             control,
+            rss_before,
+            enqueued_at: Instant::now(),
+            rounds: 0,
         });
     }
 
@@ -177,16 +201,45 @@ fn pageout_chunk_bytes() -> usize {
     chunk_mib.saturating_mul(1024 * 1024)
 }
 
+/// Best-effort resident-set size of `pid` in bytes, for telemetry only:
+/// `None` when the process is gone or `/proc` is unreadable.
+fn process_rss_bytes(pid: i32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    parse_vm_rss(&status)
+}
+
+/// Parses the `VmRSS:` line (KiB) of a `/proc/<pid>/status` body into bytes.
+fn parse_vm_rss(status: &str) -> Option<u64> {
+    let kib: u64 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .trim()
+        .strip_suffix("kB")?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(kib.saturating_mul(1024))
+}
+
 /// One queued pageout. Moves to the back of the queue after every chunk
 /// while incomplete, giving round-robin fairness across sandboxes.
 struct PageoutJob {
     id: u64,
     sandbox_id: SandboxId,
+    /// Firecracker process pid, when readable; feeds the resident-set
+    /// telemetry only.
+    pid: Option<i32>,
     pidfd: OwnedFd,
     regions: Vec<GuestRegionUffdMapping>,
     cursor: PageoutCursor,
     chunk_bytes: usize,
     control: Arc<PageoutControl>,
+    /// Resident-set size observed at submit, for the reclaimed-bytes
+    /// comparison at completion.
+    rss_before: Option<u64>,
+    enqueued_at: Instant,
+    /// Completed chunk turns; zero until the job is first re-enqueued.
+    rounds: u32,
 }
 
 /// Position within the region list: index of the region being advised plus
@@ -443,24 +496,40 @@ fn worker_loop(queue: Arc<PageoutQueue>) {
         if !job.control.is_current(job.id) {
             continue;
         }
+        // Queue latency only applies to the first pickup; later turns are
+        // round-robin scheduling, already covered by the rounds counter.
+        if job.rounds == 0 {
+            metrics::histogram!("agentenv_v_pause_pageout_queue_wait_seconds")
+                .record(job.enqueued_at.elapsed().as_secs_f64());
+        }
 
         let PageoutJob {
             id,
             ref sandbox_id,
+            pid,
             ref pidfd,
             ref regions,
             ref mut cursor,
             chunk_bytes,
             ref control,
+            rss_before,
+            enqueued_at,
+            ref mut rounds,
         } = job;
 
         control.in_flight.store(id, Ordering::SeqCst);
+        let chunk_started = Instant::now();
         // Split borrows so the scoped-closure can advise through `cursor`
         // while reading the immutable job fields.
         let outcome = run_with_scoped_capabilities(&[CAP_SYS_NICE], || {
             pageout_chunk(pidfd.as_raw_fd(), regions, cursor, chunk_bytes)
         });
         control.in_flight.store(0, Ordering::SeqCst);
+        metrics::histogram!(
+            "agentenv_v_pause_pageout_chunk_duration_seconds",
+            "status" => result_status(outcome.is_ok()),
+        )
+        .record(chunk_started.elapsed().as_secs_f64());
 
         match outcome {
             Ok((advised, complete)) => {
@@ -470,11 +539,38 @@ fn worker_loop(queue: Arc<PageoutQueue>) {
                 }
                 if complete {
                     control.note_finished(id);
-                    debug!(sandbox_id = %sandbox_id, "vPause guest memory pageout complete");
+                    let rss_after = pid.and_then(process_rss_bytes);
+                    let reclaimed = match (rss_before, rss_after) {
+                        (Some(before), Some(after)) => Some(before.saturating_sub(after)),
+                        _ => None,
+                    };
+                    if let Some(rss) = rss_after {
+                        metrics::histogram!(
+                            "agentenv_v_pause_pageout_process_rss_bytes",
+                            "phase" => "after",
+                        )
+                        .record(rss as f64);
+                    }
+                    if let Some(reclaimed) = reclaimed {
+                        metrics::counter!("agentenv_v_pause_pageout_rss_reclaimed_bytes_total")
+                            .increment(reclaimed);
+                    }
+                    debug!(
+                        sandbox_id = %sandbox_id,
+                        rounds = *rounds,
+                        rss_before = ?rss_before,
+                        rss_after = ?rss_after,
+                        reclaimed = ?reclaimed,
+                        "vPause guest memory pageout complete"
+                    );
+                    metrics::histogram!("agentenv_v_pause_pageout_job_duration_seconds")
+                        .record(enqueued_at.elapsed().as_secs_f64());
                     metrics::counter!("agentenv_v_pause_pageout_completions_total").increment(1);
                 } else if control.is_current(id) {
                     // Round-robin: go to the back of the queue and let other
                     // sandboxes advance one chunk first.
+                    *rounds += 1;
+                    metrics::counter!("agentenv_v_pause_pageout_requeue_rounds_total").increment(1);
                     queue.enqueue(job);
                 } else {
                     control.note_finished(id);
@@ -680,5 +776,14 @@ mod tests {
         control.cancel();
         assert!(!control.is_current(1));
         assert!(!control.is_current(0));
+    }
+
+    #[test]
+    fn parse_vm_rss_reads_proc_status_line() {
+        let status = "Name:\tfirecracker\nVmRSS:\t  123456 kB\nVmSwap:\t  1000 kB\n";
+        assert_eq!(parse_vm_rss(status), Some(123456 * 1024));
+        assert_eq!(parse_vm_rss("Name:\tfirecracker\n"), None);
+        assert_eq!(parse_vm_rss("VmRSS:\tinvalid kB\n"), None);
+        assert_eq!(parse_vm_rss("VmRSS:\t\n"), None);
     }
 }
