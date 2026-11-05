@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 
 pub const CAP_NET_ADMIN: i32 = 12;
+pub const CAP_SYS_PTRACE: i32 = 19;
 pub const CAP_SYS_ADMIN: i32 = 21;
 pub const CAP_SYS_NICE: i32 = 23;
 

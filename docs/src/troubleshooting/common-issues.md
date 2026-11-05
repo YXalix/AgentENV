@@ -41,7 +41,9 @@ AENV_VIRTUALIZATION_MODE=pvm
 
 **Solution**: The server requires `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` in its
 effective, permitted, and inheritable sets; KVM vPause additionally requires
-`CAP_SYS_NICE`. The installed systemd unit configures these automatically. For
+`CAP_SYS_NICE` and `CAP_SYS_PTRACE` (the pageout advises another process's
+memory, which the kernel gates on the ptrace-read access check). The installed
+systemd unit configures these automatically. For
 a source checkout, use `make start-server` or
 `scripts/run-with-capabilities.sh <server-binary>`; do not run the whole server
 as root. Also verify that the runtime account belongs to the `kvm` group, can

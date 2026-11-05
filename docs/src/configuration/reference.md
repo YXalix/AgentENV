@@ -561,7 +561,7 @@ Lightweight in-process Pause for KVM sandboxes. Explicit Pause stops the vCPUs a
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable vPause for explicit Pause requests. PVM continues to use heavy-pause. Enabling requires `CAP_SYS_NICE`. |
+| `enabled` | bool | `false` | Enable vPause for explicit Pause requests. PVM continues to use heavy-pause. Enabling requires `CAP_SYS_NICE` and `CAP_SYS_PTRACE`. |
 | `pageout_workers` | usize | `8` | Background worker threads shared by all vPaused sandboxes. Bounds the number of concurrent `process_madvise(MADV_PAGEOUT)` streams regardless of how many sandboxes pause at once. Values below 1 are clamped to 1. |
 | `pageout_chunk_mib` | usize | `64` | Guest-memory bytes (MiB) one worker may advise per chunk. Also the cancellation granularity: snapshot capture waits at most one chunk for an in-flight chunk to finish; resume and teardown cancel without waiting. Values below 1 are clamped to 1. |
 | `stop_vcpus` | bool | `true` | Stop (pause) the vCPUs during vPause. When `false`, the vCPUs keep running and vPause only queues guest-memory pageout, opportunistically reclaiming idle guest pages to host swap; timeout and graceful shutdown still stop the VM before capturing a persistent snapshot. |
@@ -599,7 +599,13 @@ tuning analysis:
   job, a signal for tuning `pageout_chunk_mib` and `pageout_workers`);
   `agentenv_v_pause_pageout_paths_total{path,reason}` accounts for skipped and
   full-region fallback runs (`tracking_disabled`, `query_failed`,
-  `ranges_unusable`, `regions_fetch_failed`, `empty_window`).
+  `ranges_unusable`, `regions_fetch_failed`, `empty_window`);
+  `agentenv_v_pause_pageout_dropped_jobs_total{reason="target_gone"|"cancelled"}`
+  counts jobs dropped after losing their race (the Firecracker process already
+  exited — teardown, graceful shutdown, or a host OOM kill, which takes
+  Firecracker first via its `oom_score_adj` — or the job was cancelled while a
+  chunk was in flight), while `agentenv_v_pause_pageout_failures_total` counts
+  only genuine advise failures.
 
 ## `[memory_snapshot]`
 

@@ -42,10 +42,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
 use firecracker_client::models::{DirtyMemoryRange, DirtyMemoryRanges, GuestRegionUffdMapping};
+use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use tracing::{debug, warn};
 
 use crate::observability::prometheus::result_status;
-use crate::privileges::{run_with_scoped_capabilities, CAP_SYS_NICE};
+use crate::privileges::{run_with_scoped_capabilities, CAP_SYS_NICE, CAP_SYS_PTRACE};
 use crate::types::SandboxId;
 
 /// `process_madvise(MADV_PAGEOUT)` needs 4 KiB-aligned host ranges, matching
@@ -206,6 +207,14 @@ fn pageout_chunk_bytes() -> usize {
 fn process_rss_bytes(pid: i32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     parse_vm_rss(&status)
+}
+
+/// Whether the process behind `pidfd` has already exited: a pidfd becomes
+/// readable on task death, so a zero-timeout poll is a race-free probe.
+fn target_process_exited(pidfd: &OwnedFd) -> bool {
+    let mut pollfds = [PollFd::new(pidfd, PollFlags::IN)];
+    let timeout = Timespec::try_from(Duration::ZERO).expect("zero timeout always fits a timespec");
+    poll(&mut pollfds, Some(&timeout)).is_ok() && pollfds[0].revents().contains(PollFlags::IN)
 }
 
 /// Parses the `VmRSS:` line (KiB) of a `/proc/<pid>/status` body into bytes.
@@ -521,7 +530,13 @@ fn worker_loop(queue: Arc<PageoutQueue>) {
         let chunk_started = Instant::now();
         // Split borrows so the scoped-closure can advise through `cursor`
         // while reading the immutable job fields.
-        let outcome = run_with_scoped_capabilities(&[CAP_SYS_NICE], || {
+        //
+        // `process_madvise` on the Firecracker process rides the kernel's
+        // ptrace-read access check (`mm_access`), which demands effective
+        // `CAP_SYS_PTRACE` even for same-uid targets with an empty capability
+        // set — without it every chunk fails with `EACCES`. `CAP_SYS_NICE`
+        // covers the reclaim advice itself.
+        let outcome = run_with_scoped_capabilities(&[CAP_SYS_NICE, CAP_SYS_PTRACE], || {
             pageout_chunk(pidfd.as_raw_fd(), regions, cursor, chunk_bytes)
         });
         control.in_flight.store(0, Ordering::SeqCst);
@@ -577,13 +592,47 @@ fn worker_loop(queue: Arc<PageoutQueue>) {
                 }
             }
             Err(error) => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    error = %error,
-                    "vPause pageout chunk failed; dropping remaining pageout"
-                );
-                control.note_finished(id);
-                metrics::counter!("agentenv_v_pause_pageout_failures_total").increment(1);
+                // A chunk can also lose the race it was already allowed to
+                // lose: the Firecracker process dies before or during the
+                // advise (teardown, graceful shutdown, or a host OOM kill —
+                // Firecracker runs with `oom_score_adj=1000`, so it dies
+                // first under memory pressure), or the job is cancelled
+                // while the chunk is in flight. The pageout is moot in both
+                // cases; log quietly and account them separately so genuine
+                // failures stay visible. `Debug` renders the whole error
+                // chain; `Display` would stop at the address context and
+                // hide the errno behind the failure.
+                let superseded = !control.is_current(id);
+                let target_gone = target_process_exited(pidfd);
+                if superseded || target_gone {
+                    let reason = if target_gone {
+                        "target_gone"
+                    } else {
+                        "cancelled"
+                    };
+                    metrics::counter!(
+                        "agentenv_v_pause_pageout_dropped_jobs_total",
+                        "reason" => reason,
+                    )
+                    .increment(1);
+                    debug!(
+                        sandbox_id = %sandbox_id,
+                        rounds = *rounds,
+                        target_gone,
+                        superseded,
+                        error = ?error,
+                        "vPause pageout dropped after losing its target"
+                    );
+                    control.note_finished(id);
+                } else {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        error = ?error,
+                        "vPause pageout chunk failed; dropping remaining pageout"
+                    );
+                    control.note_finished(id);
+                    metrics::counter!("agentenv_v_pause_pageout_failures_total").increment(1);
+                }
             }
         }
     }

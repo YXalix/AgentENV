@@ -15,13 +15,14 @@ use rustix::process::{pidfd_open, pidfd_send_signal, Pid, PidfdFlags, Signal};
 use tokio::io::unix::AsyncFd;
 use tracing::warn;
 
-pub use linux_cap::{CAP_NET_ADMIN, CAP_SYS_ADMIN, CAP_SYS_NICE};
+pub use linux_cap::{CAP_NET_ADMIN, CAP_SYS_ADMIN, CAP_SYS_NICE, CAP_SYS_PTRACE};
 
 fn capability_name(capability: i32) -> &'static str {
     match capability {
         CAP_NET_ADMIN => "CAP_NET_ADMIN",
         CAP_SYS_ADMIN => "CAP_SYS_ADMIN",
         CAP_SYS_NICE => "CAP_SYS_NICE",
+        CAP_SYS_PTRACE => "CAP_SYS_PTRACE",
         _ => "unknown capability",
     }
 }
@@ -37,7 +38,11 @@ pub fn require_runtime_capabilities() -> Result<()> {
     let mut required = vec![CAP_NET_ADMIN, CAP_SYS_ADMIN];
     let config = crate::cfg::ConfigManager::global_config();
     if config.v_pause.effective(config.virtualization_mode) {
+        // Pageout advises guest memory of the Firecracker process, so the
+        // worker needs CAP_SYS_NICE for MADV_PAGEOUT and CAP_SYS_PTRACE for
+        // the kernel's cross-process ptrace-read access check.
         required.push(CAP_SYS_NICE);
+        required.push(CAP_SYS_PTRACE);
     }
     let missing = required
         .into_iter()

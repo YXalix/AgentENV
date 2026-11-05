@@ -79,14 +79,14 @@ if ! ulimit -l "$memlock_limit"; then
 fi
 
 capability_args=(
-    "--inh-caps=-all,+net_admin,+sys_admin,+sys_nice"
-    "--ambient-caps=-all,+net_admin,+sys_admin,+sys_nice"
-    "--bounding-set=-all,+net_admin,+sys_admin,+sys_nice"
+    "--inh-caps=-all,+net_admin,+sys_admin,+sys_nice,+sys_ptrace"
+    "--ambient-caps=-all,+net_admin,+sys_admin,+sys_nice,+sys_ptrace"
+    "--bounding-set=-all,+net_admin,+sys_admin,+sys_nice,+sys_ptrace"
     --nnp
 )
 
 if [[ "$run_uid" == "0" ]]; then
-    echo "warning: ${root_warning}; running as UID 0 with only CAP_NET_ADMIN, CAP_SYS_ADMIN, and CAP_SYS_NICE" >&2
+    echo "warning: ${root_warning}; running as UID 0 with only CAP_NET_ADMIN, CAP_SYS_ADMIN, CAP_SYS_NICE, and CAP_SYS_PTRACE" >&2
     exec setpriv \
         --securebits=+noroot,+noroot_locked \
         "${capability_args[@]}" \

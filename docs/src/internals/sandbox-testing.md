@@ -527,7 +527,7 @@ resumed_sandbox.stop().await?;
    pool of `[firecracker] cgroup_pool_size` leaves (default 144) once at
    startup and spreads all Firecracker processes across them round-robin;
    nothing is created or removed per spawn.
-5. When testing `[v_pause]`, additionally activate host swap, provide `CAP_SYS_NICE`, and run `fc::v_pause_reclaims_memory_without_waiting_for_envd` and `fc::v_pause_reclaims_memory_and_preserves_heavy_snapshot` with `--ignored`. Both require active swap. The first checks RSS reclamation, repeated in-place resume, and heavy snapshot restore without depending on envd readiness; the second additionally checks guest-visible disk state. WSL hosts may first need `modprobe kvm`, `modprobe kvm_intel`, and `modprobe ublk_drv`.
+5. When testing `[v_pause]`, additionally activate host swap, provide `CAP_SYS_NICE` and `CAP_SYS_PTRACE`, and run `fc::v_pause_reclaims_memory_without_waiting_for_envd` and `fc::v_pause_reclaims_memory_and_preserves_heavy_snapshot` with `--ignored`. Both require active swap. The first checks RSS reclamation, repeated in-place resume, and heavy snapshot restore without depending on envd readiness; the second additionally checks guest-visible disk state. WSL hosts may first need `modprobe kvm`, `modprobe kvm_intel`, and `modprobe ublk_drv`.
 6. Update `config/default.toml` paths, or point `AENV_CONFIG_PATH` to a custom config file.
 7. Ensure `/dev/kvm` is accessible by the runtime user and the configured
    virtualization mode matches the host modules.
