@@ -22,6 +22,12 @@ pub struct DirtyMemoryRanges {
     pub memory_size: i64,
     #[serde(rename = "ranges")]
     pub ranges: Vec<models::DirtyMemoryRange>,
+    /// Guest pages written during the current dirty-log window, coalesced. Cleared by this query, so query it at most once per window.
+    #[serde(rename = "dirty_ranges")]
+    pub dirty_ranges: Vec<models::DirtyMemoryRange>,
+    /// Guest pages discarded via balloon free-page reporting since the previous query, coalesced. Their content reads as zero afterwards. Cleared by this query.
+    #[serde(rename = "discarded_ranges")]
+    pub discarded_ranges: Vec<models::DirtyMemoryRange>,
 }
 
 impl DirtyMemoryRanges {
@@ -30,11 +36,15 @@ impl DirtyMemoryRanges {
         page_size: i32,
         memory_size: i64,
         ranges: Vec<models::DirtyMemoryRange>,
+        dirty_ranges: Vec<models::DirtyMemoryRange>,
+        discarded_ranges: Vec<models::DirtyMemoryRange>,
     ) -> DirtyMemoryRanges {
         DirtyMemoryRanges {
             page_size,
             memory_size,
             ranges,
+            dirty_ranges,
+            discarded_ranges,
         }
     }
 }

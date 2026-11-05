@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
+use firecracker_client::models::GuestRegionUffdMapping;
 use nix::libc;
 use tempfile::TempDir;
 use tracing::{debug, trace, warn};
@@ -21,7 +22,7 @@ use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
     restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
 };
-use super::pageout::PageoutControl;
+use super::pageout::{pageout_regions_from_dirty, PageoutControl};
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::{FirecrackerInstance, SANDBOX_NET_IFACE_ID, SANDBOX_TAP_IFACE_NAME};
 use crate::sandbox::custom_extension::{
@@ -224,6 +225,17 @@ pub struct FirecrackerSandbox {
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
 
+/// What to advise for one vPause pageout.
+enum PageoutTargets {
+    /// The current dirty-log window minus balloon-discarded pages.
+    DirtyWindow(Vec<GuestRegionUffdMapping>),
+    /// The whole guest memory region list.
+    FullRegions,
+    /// The dirty window is empty: the guest wrote nothing since the last
+    /// query, so its working set is already in swap.
+    Skip,
+}
+
 /// Firecracker-specific capture payload carried as [`CapturedSandboxSnapshot`]
 /// artifacts: what startup-pack recording needs to re-boot from the capture
 /// while the layers are still node-local, plus the lease keeping the capture
@@ -405,10 +417,45 @@ impl SandboxBackend for FirecrackerSandbox {
         // Memory reclaim is best-effort on the background pageout pool: the
         // workers drain guest memory to swap over time. Failing to even queue
         // the job keeps the sandbox paused with resident memory.
-        match self.fc_instance.guest_memory_pageout_targets().await {
-            Ok((pidfd, regions)) => {
-                PageoutControl::spawn_job(Arc::clone(&self.pageout), self.id, pidfd, regions);
-            }
+        match self.fc_instance.pageout_pidfd() {
+            Ok(pidfd) => match self.pageout_targets().await {
+                PageoutTargets::DirtyWindow(dirty_regions) => {
+                    metrics::counter!("agentenv_v_pause_pageout_dirty_driven_total").increment(1);
+                    PageoutControl::spawn_job(
+                        Arc::clone(&self.pageout),
+                        self.id,
+                        pidfd,
+                        dirty_regions,
+                    );
+                }
+                PageoutTargets::FullRegions => {
+                    match self.fc_instance.guest_memory_regions().await {
+                        Ok(regions) => {
+                            PageoutControl::spawn_job(
+                                Arc::clone(&self.pageout),
+                                self.id,
+                                pidfd,
+                                regions,
+                            );
+                        }
+                        Err(error) => {
+                            metrics::counter!("agentenv_v_pause_pageout_failures_total")
+                                .increment(1);
+                            warn!(
+                                sandbox_id = %self.id,
+                                error = %error,
+                                "failed to queue guest memory pageout; sandbox stays paused with resident memory"
+                            );
+                        }
+                    }
+                }
+                PageoutTargets::Skip => {
+                    debug!(
+                        sandbox_id = %self.id,
+                        "dirty pageout window empty; nothing to reclaim beyond swap"
+                    );
+                }
+            },
             Err(error) => {
                 metrics::counter!("agentenv_v_pause_pageout_failures_total").increment(1);
                 warn!(
@@ -695,6 +742,62 @@ impl SandboxExecutor for FirecrackerSandbox {
 // ── FirecrackerSandbox public API ────────────────────────────────────────────
 
 impl FirecrackerSandbox {
+    /// Picks the pageout victim set for this pause. With KVM dirty tracking
+    /// enabled, advises only the current dirty-log window minus the pages
+    /// Firecracker's balloon has discarded — pages the guest never wrote,
+    /// still holds in swap, or freed after writing are skipped without a host
+    /// page-table scan. Falls back to the full region list when dirty
+    /// tracking is off (e.g. PVM mode) or the query fails.
+    async fn pageout_targets(&self) -> PageoutTargets {
+        if !ConfigManager::global_config()
+            .memory_snapshot
+            .track_dirty_pages
+        {
+            return PageoutTargets::FullRegions;
+        }
+        match self.fc_instance.get_dirty_window_ranges().await {
+            Ok(ranges) => {
+                let window_bytes =
+                    u64::try_from(ranges.dirty_ranges.iter().map(|r| r.length).sum::<i64>())
+                        .unwrap_or(0);
+                metrics::counter!("agentenv_v_pause_pageout_dirty_window_bytes_total")
+                    .increment(window_bytes);
+                let discarded_bytes = u64::try_from(
+                    ranges
+                        .discarded_ranges
+                        .iter()
+                        .map(|r| r.length)
+                        .sum::<i64>(),
+                )
+                .unwrap_or(0);
+                if discarded_bytes > 0 {
+                    metrics::counter!("agentenv_v_pause_pageout_discard_masked_bytes_total")
+                        .increment(discarded_bytes);
+                }
+                match pageout_regions_from_dirty(&ranges) {
+                    Ok(Some(regions)) => PageoutTargets::DirtyWindow(regions),
+                    Ok(None) => PageoutTargets::Skip,
+                    Err(error) => {
+                        warn!(
+                            sandbox_id = %self.id,
+                            error = %error,
+                            "dirty pageout ranges unusable; falling back to full-region pageout"
+                        );
+                        PageoutTargets::FullRegions
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(
+                    sandbox_id = %self.id,
+                    error = %error,
+                    "dirty memory range query failed; falling back to full-region pageout"
+                );
+                PageoutTargets::FullRegions
+            }
+        }
+    }
+
     async fn recover_capture_failure<T>(
         &mut self,
         operation: &'static str,

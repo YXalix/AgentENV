@@ -821,6 +821,8 @@ mod tests {
                 image_offset: 0,
                 length: first_chunk + OVERLAYBD_ALIGNMENT as i64,
             }],
+            dirty_ranges: Vec::new(),
+            discarded_ranges: Vec::new(),
         };
 
         let (mappings, memory_size) =
@@ -845,6 +847,8 @@ mod tests {
             page_size: 2048,
             memory_size: FIRECRACKER_DIRTY_PAGE_SIZE as i64,
             ranges: Vec::new(),
+            dirty_ranges: Vec::new(),
+            discarded_ranges: Vec::new(),
         };
 
         let err = dirty_ranges_to_segment_mappings(&dirty_ranges).unwrap_err();
@@ -865,6 +869,8 @@ mod tests {
                 image_offset: 0,
                 length: OVERLAYBD_ALIGNMENT as i64,
             }],
+            dirty_ranges: Vec::new(),
+            discarded_ranges: Vec::new(),
         };
 
         let err = dirty_ranges_to_segment_mappings(&dirty_ranges).unwrap_err();
@@ -892,6 +898,8 @@ mod tests {
                     length: FIRECRACKER_DIRTY_PAGE_SIZE as i64,
                 },
             ],
+            dirty_ranges: Vec::new(),
+            discarded_ranges: Vec::new(),
         };
 
         let err = dirty_ranges_to_segment_mappings(&dirty_ranges).unwrap_err();

@@ -862,8 +862,21 @@ paths:
         virtual address to read from and the destination image offset. This API
         is intended for paused, post-boot VMs during snapshot creation. The
         query is logically non-clearing; dirty pages remain dirty for a later
-        snapshot if the external consumer fails.
+        snapshot if the external consumer fails. The dirty window and the
+        balloon discard log are cleared by every query regardless of the
+        requested views.
       operationId: getDirtyMemoryRanges
+      parameters:
+        - name: views
+          in: query
+          type: string
+          required: false
+          description:
+            Comma-separated selection of views to compute and populate:
+            `snapshot` (the cumulative `ranges`, costing two extra passes over
+            every guest page), `window` (`dirty_ranges`), `discards`
+            (`discarded_ranges`). Defaults to all views. Memory-reclaim
+            consumers should request `window,discards`.
       responses:
         200:
           description: Dirty guest memory ranges
@@ -1397,6 +1410,8 @@ definitions:
       - page_size
       - memory_size
       - ranges
+      - dirty_ranges
+      - discarded_ranges
     properties:
       page_size:
         type: integer
@@ -1407,6 +1422,21 @@ definitions:
         description: Total byte size of the contiguous memory snapshot image.
       ranges:
         type: array
+        items:
+          $ref: "#/definitions/DirtyMemoryRange"
+      dirty_ranges:
+        type: array
+        description:
+          Guest pages written during the current dirty-log window, coalesced.
+          Cleared by this query, so query it at most once per window.
+        items:
+          $ref: "#/definitions/DirtyMemoryRange"
+      discarded_ranges:
+        type: array
+        description:
+          Guest pages discarded via balloon free-page reporting since the
+          previous query, coalesced. Their content reads as zero afterwards.
+          Cleared by this query.
         items:
           $ref: "#/definitions/DirtyMemoryRange"
 

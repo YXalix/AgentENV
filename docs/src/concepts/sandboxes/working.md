@@ -82,6 +82,12 @@ best-effort and continues on a small pool of background pageout workers
 (`[v_pause].pageout_workers` threads, each advising one
 `[v_pause].pageout_chunk_mib` chunk of one sandbox per turn) so pausing
 thousands of sandboxes at once cannot stampede the host's swap subsystem.
+With `memory_snapshot.track_dirty_pages = true` (the KVM-mode default),
+workers advise only the sandbox's current KVM dirty-log window minus the
+pages Firecracker's balloon has discarded: pages that were never written,
+still sit in swap, or were freed by the guest after being written cost no
+advise work at all, and no host page-table scan runs on the pause path.
+Otherwise the whole guest memory is advised.
 Resume cancels any remaining pageout (waiting at most one chunk) and continues
 that process, faulting memory back on demand; no
 snapshot is written. This live-vPause state is node-local and is not recovered

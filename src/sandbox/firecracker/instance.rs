@@ -539,27 +539,26 @@ impl FirecrackerInstance {
             .context("Failed to resume microVM")
     }
 
-    /// Captures the pidfd and guest memory regions the background pageout
-    /// pool (`super::pageout`) needs to advise `MADV_PAGEOUT` on this
-    /// instance's guest memory.
-    pub async fn guest_memory_pageout_targets(
-        &self,
-    ) -> Result<(OwnedFd, Vec<GuestRegionUffdMapping>)> {
-        let regions = self
-            .client
+    /// Captures the pidfd the background pageout pool (`super::pageout`)
+    /// needs to advise `MADV_PAGEOUT` on this instance's guest memory.
+    pub fn pageout_pidfd(&self) -> Result<OwnedFd> {
+        self.process
+            .as_ref()
+            .context("firecracker process is not running")?
+            .pidfd()
+            .context("failed to open pidfd of the firecracker process")
+    }
+
+    /// Returns the guest memory region mappings to advise over.
+    pub async fn guest_memory_regions(&self) -> Result<Vec<GuestRegionUffdMapping>> {
+        self.client
             .request::<(), Vec<GuestRegionUffdMapping>>(
                 Method::GET,
                 "/vm/guest-memory-regions",
                 None,
             )
             .await
-            .context("Failed to get guest memory regions")?;
-        let pidfd = self
-            .process
-            .as_ref()
-            .context("firecracker process is not running")?
-            .pidfd()?;
-        Ok((pidfd, regions))
+            .context("Failed to get guest memory regions")
     }
 
     /// Creates a diff snapshot containing VM state only.
@@ -583,6 +582,23 @@ impl FirecrackerInstance {
             .request::<(), DirtyMemoryRanges>(Method::GET, "/vm/dirty-memory-ranges", None)
             .await
             .context("Failed to get dirty memory ranges")
+    }
+
+    /// Returns the current dirty-log window and the balloon discard log for
+    /// vPause pageout, skipping the cumulative snapshot view that costs two
+    /// extra passes over every guest page per query. The window and the
+    /// discard log are cleared by the query either way, so the snapshot
+    /// path's cumulative view stays intact.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_dirty_window_ranges(&self) -> Result<DirtyMemoryRanges> {
+        self.client
+            .request::<(), DirtyMemoryRanges>(
+                Method::GET,
+                "/vm/dirty-memory-ranges?views=window,discards",
+                None,
+            )
+            .await
+            .context("Failed to get dirty window ranges")
     }
 
     /// Loads a snapshot with uffd memory backend.

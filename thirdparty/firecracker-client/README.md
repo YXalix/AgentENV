@@ -42,6 +42,8 @@ Class | Method | HTTP request | Description
  - [CpuTemplate](docs/CpuTemplate.md)
  - [CpuidLeafModifier](docs/CpuidLeafModifier.md)
  - [CpuidRegisterModifier](docs/CpuidRegisterModifier.md)
+ - [DirtyMemoryRange](docs/DirtyMemoryRange.md)
+ - [DirtyMemoryRanges](docs/DirtyMemoryRanges.md)
  - [Drive](docs/Drive.md)
  - [EntropyDevice](docs/EntropyDevice.md)
  - [Error](docs/Error.md)

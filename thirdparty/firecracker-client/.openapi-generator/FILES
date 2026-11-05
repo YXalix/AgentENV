@@ -14,6 +14,8 @@ docs/CpuConfig.md
 docs/CpuTemplate.md
 docs/CpuidLeafModifier.md
 docs/CpuidRegisterModifier.md
+docs/DirtyMemoryRange.md
+docs/DirtyMemoryRanges.md
 docs/Drive.md
 docs/EntropyDevice.md
 docs/Error.md
@@ -60,6 +62,8 @@ src/models/cpu_config.rs
 src/models/cpu_template.rs
 src/models/cpuid_leaf_modifier.rs
 src/models/cpuid_register_modifier.rs
+src/models/dirty_memory_range.rs
+src/models/dirty_memory_ranges.rs
 src/models/drive.rs
 src/models/entropy_device.rs
 src/models/error.rs
