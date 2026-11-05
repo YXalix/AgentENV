@@ -557,7 +557,7 @@ make them through the TOML settings, not by editing the generated JSON.
 
 ## `[v_pause]`
 
-Lightweight in-process Pause for KVM sandboxes. Explicit Pause stops the vCPUs and queues `process_madvise(MADV_PAGEOUT)` on guest memory for a pool of background workers while retaining the Firecracker process; the Pause call itself returns once the vCPUs stop, and reclaim completes asynchronously (best-effort). With `stop_vcpus = false`, the vCPUs keep running and vPause only queues the pageout: the Pause call returns once pageout is queued, and reclaim is opportunistic — guest pages fault back in when the workload touches them. When `memory_snapshot.track_dirty_pages` is on (the KVM-mode default), workers advise only the current KVM dirty-log window minus balloon-discarded pages (tracked by `agentenv_v_pause_pageout_dirty_window_bytes_total`, `agentenv_v_pause_pageout_discard_masked_bytes_total`, and `agentenv_v_pause_pageout_dirty_driven_total`); otherwise they advise whole guest regions. Resume is lazy, cancels any remaining pageout, and does not recreate the VM. Long-idle timeout and graceful shutdown first resume the VM, then use the persistent heavy-pause path. vPause is node-local and is not recovered after an abnormal server or host crash.
+Lightweight in-process Pause for KVM sandboxes. Explicit Pause stops the vCPUs and queues `process_madvise(MADV_PAGEOUT)` on guest memory for a pool of background workers while retaining the Firecracker process; the Pause call itself returns once the vCPUs stop, and reclaim completes asynchronously (best-effort). With `stop_vcpus = false`, the vCPUs keep running and vPause only queues the pageout: the Pause call returns once pageout is queued, and reclaim is opportunistic — guest pages fault back in when the workload touches them. When `memory_snapshot.track_dirty_pages` is on (the KVM-mode default), workers advise the cumulative dirty view — every page the guest wrote since the memory baseline — minus balloon-discarded pages (tracked by `agentenv_v_pause_pageout_dirty_union_bytes_total`, `agentenv_v_pause_pageout_discard_masked_bytes_total`, and `agentenv_v_pause_pageout_dirty_driven_total`); the union reclaims pages an earlier pageout swapped out and the guest only read back in since, which a write-only KVM window would miss. Otherwise they advise whole guest regions. Resume is lazy, cancels any remaining pageout, and does not recreate the VM. Long-idle timeout and graceful shutdown first resume the VM, then use the persistent heavy-pause path. vPause is node-local and is not recovered after an abnormal server or host crash.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -579,7 +579,7 @@ tuning analysis:
 
 - Latency: `agentenv_sandbox_stage_duration_seconds{operation="v_pause"}`
   covers the synchronous part of Pause (`stage="vcpu_stop"`,
-  `stage="dirty_window_query"`, `stage="guest_regions_fetch"`); the background
+  `stage="dirty_union_query"`, `stage="guest_regions_fetch"`); the background
   drain is covered by `agentenv_v_pause_pageout_queue_wait_seconds` (enqueue to
   first pickup), `agentenv_v_pause_pageout_chunk_duration_seconds` (one
   `process_madvise` turn, labeled by `status`), and
@@ -599,7 +599,7 @@ tuning analysis:
   job, a signal for tuning `pageout_chunk_mib` and `pageout_workers`);
   `agentenv_v_pause_pageout_paths_total{path,reason}` accounts for skipped and
   full-region fallback runs (`tracking_disabled`, `query_failed`,
-  `ranges_unusable`, `regions_fetch_failed`, `empty_window`);
+  `ranges_unusable`, `regions_fetch_failed`, `empty_union`);
   `agentenv_v_pause_pageout_dropped_jobs_total{reason="target_gone"|"cancelled"}`
   counts jobs dropped after losing their race (the Firecracker process already
   exited — teardown, graceful shutdown, or a host OOM kill, which takes

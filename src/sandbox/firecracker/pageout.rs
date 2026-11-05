@@ -11,15 +11,15 @@
 //! Two victim-selection paths exist:
 //!
 //! - Dirty-driven (default when `memory_snapshot.track_dirty_pages` is on):
-//!   Firecracker reports the current KVM dirty-log window
-//!   (`dirty_ranges`) and the ranges its balloon has discarded since the
-//!   previous query (`discarded_ranges`, reading as zero afterwards). This
-//!   module subtracts the discarded ranges — pages written and then freed
-//!   within the same window are dead, and everything still in swap is absent
-//!   from the window anyway — so `MADV_PAGEOUT` never walks pages the guest
-//!   never wrote or has already freed, with no host page-table scan. The KVM
-//!   log auto-clears per query, so the next window only contains pages
-//!   faulted back in.
+//!   Firecracker reports its cumulative dirty view (`ranges`, every page the
+//!   guest wrote since the memory baseline) and the ranges its balloon has
+//!   discarded since the previous query (`discarded_ranges`, reading as zero
+//!   afterwards). This module subtracts the discarded ranges — pages freed
+//!   after being written are dead — so `MADV_PAGEOUT` never walks pages the
+//!   guest never wrote or has already freed, with no host page-table scan.
+//!   The union reclaims pages an earlier pageout swapped out and the guest
+//!   only read back in, which write-only KVM windows miss; pages still in
+//!   swap are inside the union but advising them costs a walk without I/O.
 //! - Full-region fallback (dirty tracking off, e.g. PVM mode, or when the
 //!   dirty query fails): the job advises the whole guest memory region list.
 //!
@@ -334,17 +334,17 @@ fn pageout_chunk(
 }
 
 /// Subtracts coalesced, ascending, disjoint `discarded` intervals from
-/// coalesced, ascending, disjoint `window` intervals, matching on
+/// coalesced, ascending, disjoint `dirty` intervals, matching on
 /// `image_offset`. Both lists come from Firecracker coalescing per slot in
 /// ascending slot order. Surviving pieces keep the source range's host base,
 /// offset by their position inside it.
 fn subtract_ranges(
-    window: &[DirtyMemoryRange],
+    dirty: &[DirtyMemoryRange],
     discarded: &[DirtyMemoryRange],
 ) -> Vec<DirtyMemoryRange> {
     let mut result = Vec::new();
     let mut disc_idx = 0usize;
-    for range in window {
+    for range in dirty {
         let range_end = range.image_offset + range.length;
         // Skip discards that end before this window range begins.
         while disc_idx < discarded.len()
@@ -389,14 +389,15 @@ fn push_victim(
     });
 }
 
-/// Converts Firecracker's dirty-log window minus balloon free-page-reporting
-/// discards into advise targets. Pages written and then discarded within the
-/// same window are dead (their content reads as zero and they are typically
-/// non-present); pages still in swap never appear in the window; pages
-/// discarded before the window and since re-written stay, because the discard
-/// report only covers the window since the last query. Returns `None` when
-/// nothing survives; an error means the response cannot be advised as-is and
-/// the caller should fall back to the full region list.
+/// Converts Firecracker's cumulative dirty view minus balloon
+/// free-page-reporting discards into advise targets. The union covers every
+/// page written since the memory baseline, so pages swapped out earlier and
+/// only read back in since are re-advised; pages written and then discarded
+/// are dead (their content reads as zero and they are typically
+/// non-present); pages still in swap stay in the union but advising them
+/// costs a walk without I/O. Returns `None` when nothing survives; an error
+/// means the response cannot be advised as-is and the caller should fall
+/// back to the full region list.
 pub(crate) fn pageout_regions_from_dirty(
     ranges: &DirtyMemoryRanges,
 ) -> Result<Option<Vec<GuestRegionUffdMapping>>> {
@@ -405,7 +406,7 @@ pub(crate) fn pageout_regions_from_dirty(
         "unsupported pageout page size {}",
         ranges.page_size
     );
-    let victims = subtract_ranges(&ranges.dirty_ranges, &ranges.discarded_ranges);
+    let victims = subtract_ranges(&ranges.ranges, &ranges.discarded_ranges);
     if victims.is_empty() {
         return Ok(None);
     }
@@ -733,16 +734,15 @@ mod tests {
         Ok(())
     }
 
-    /// The dirty-driven victims are the dirty-log window minus the balloon
-    /// discard log: pieces cut at the discarded pages keep the source range's
-    /// host base, and a fully covered window yields nothing.
+    /// The dirty-driven victims are the cumulative dirty view minus the
+    /// balloon discard log: pieces cut at the discarded pages keep the source
+    /// range's host base, and a fully covered union yields nothing.
     #[test]
     fn pageout_regions_from_dirty_subtracts_discards() -> Result<()> {
         let base = 0x7f00_0000_0000i64;
         let ranges = DirtyMemoryRanges::new(
             4096,
             (8 * PAGEOUT_PAGE_SIZE) as i64,
-            Vec::new(),
             vec![
                 DirtyMemoryRange::new(base, 0, (3 * PAGEOUT_PAGE_SIZE) as i64),
                 DirtyMemoryRange::new(
@@ -751,6 +751,7 @@ mod tests {
                     PAGEOUT_PAGE_SIZE as i64,
                 ),
             ],
+            Vec::new(),
             vec![DirtyMemoryRange::new(
                 base + PAGEOUT_PAGE_SIZE as i64,
                 PAGEOUT_PAGE_SIZE as i64,
@@ -780,20 +781,20 @@ mod tests {
     }
 
     #[test]
-    fn pageout_regions_from_dirty_reports_empty_window() -> Result<()> {
+    fn pageout_regions_from_dirty_reports_empty_union() -> Result<()> {
         let ranges = DirtyMemoryRanges::new(4096, 0, Vec::new(), Vec::new(), Vec::new());
         assert!(pageout_regions_from_dirty(&ranges)?.is_none());
 
-        // A window fully covered by discards also yields nothing to advise.
+        // A union fully covered by discards also yields nothing to advise.
         let covered = DirtyMemoryRanges::new(
             4096,
             (2 * PAGEOUT_PAGE_SIZE) as i64,
-            Vec::new(),
             vec![DirtyMemoryRange::new(
                 0x1000_0000,
                 0,
                 (2 * PAGEOUT_PAGE_SIZE) as i64,
             )],
+            Vec::new(),
             vec![DirtyMemoryRange::new(
                 0x1000_0000,
                 0,
@@ -809,8 +810,8 @@ mod tests {
         let ranges = DirtyMemoryRanges::new(
             65536,
             PAGEOUT_PAGE_SIZE as i64,
-            Vec::new(),
             vec![DirtyMemoryRange::new(0, 0, PAGEOUT_PAGE_SIZE as i64)],
+            Vec::new(),
             Vec::new(),
         );
         assert!(pageout_regions_from_dirty(&ranges).is_err());

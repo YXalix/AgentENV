@@ -584,21 +584,23 @@ impl FirecrackerInstance {
             .context("Failed to get dirty memory ranges")
     }
 
-    /// Returns the current dirty-log window and the balloon discard log for
-    /// vPause pageout, skipping the cumulative snapshot view that costs two
-    /// extra passes over every guest page per query. The window and the
-    /// discard log are cleared by the query either way, so the snapshot
-    /// path's cumulative view stays intact.
+    /// Returns the cumulative dirty view (every page written since the memory
+    /// baseline, e.g. the snapshot load) and the balloon discard log for vPause
+    /// pageout. A union covers pages paged out and only read back in since,
+    /// which no longer appear in a write-only KVM window; pages still in swap
+    /// cost an advise walk without I/O. The window and the discard log are
+    /// cleared by the query either way, but vPause no longer consumes the
+    /// window and the snapshot path's cumulative view stays intact.
     #[tracing::instrument(skip(self))]
-    pub async fn get_dirty_window_ranges(&self) -> Result<DirtyMemoryRanges> {
+    pub async fn get_dirty_union_ranges(&self) -> Result<DirtyMemoryRanges> {
         self.client
             .request::<(), DirtyMemoryRanges>(
                 Method::GET,
-                "/vm/dirty-memory-ranges?views=window,discards",
+                "/vm/dirty-memory-ranges?views=snapshot,discards",
                 None,
             )
             .await
-            .context("Failed to get dirty window ranges")
+            .context("Failed to get dirty union ranges")
     }
 
     /// Loads a snapshot with uffd memory backend.

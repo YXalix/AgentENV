@@ -228,12 +228,12 @@ pub struct FirecrackerSandbox {
 
 /// What to advise for one vPause pageout.
 enum PageoutTargets {
-    /// The current dirty-log window minus balloon-discarded pages.
-    DirtyWindow(Vec<GuestRegionUffdMapping>),
+    /// The cumulative dirty view minus balloon-discarded pages.
+    DirtyUnion(Vec<GuestRegionUffdMapping>),
     /// The whole guest memory region list.
     FullRegions,
-    /// The dirty window is empty: the guest wrote nothing since the last
-    /// query, so its working set is already in swap.
+    /// The dirty union is empty: the guest wrote nothing since the memory
+    /// baseline, so its working set still matches the snapshot image.
     Skip,
 }
 
@@ -425,7 +425,7 @@ impl SandboxBackend for FirecrackerSandbox {
         // the job keeps the sandbox paused with resident memory.
         match self.fc_instance.pageout_pidfd() {
             Ok(pidfd) => match self.pageout_targets().await {
-                PageoutTargets::DirtyWindow(dirty_regions) => {
+                PageoutTargets::DirtyUnion(dirty_regions) => {
                     metrics::counter!("agentenv_v_pause_pageout_dirty_driven_total").increment(1);
                     PageoutControl::spawn_job(
                         Arc::clone(&self.pageout),
@@ -474,7 +474,7 @@ impl SandboxBackend for FirecrackerSandbox {
                 PageoutTargets::Skip => {
                     debug!(
                         sandbox_id = %self.id,
-                        "dirty pageout window empty; nothing to reclaim beyond swap"
+                        "dirty pageout union empty; nothing to reclaim beyond the snapshot image"
                     );
                 }
             },
@@ -765,10 +765,12 @@ impl SandboxExecutor for FirecrackerSandbox {
 
 impl FirecrackerSandbox {
     /// Picks the pageout victim set for this pause. With KVM dirty tracking
-    /// enabled, advises only the current dirty-log window minus the pages
-    /// Firecracker's balloon has discarded — pages the guest never wrote,
-    /// still holds in swap, or freed after writing are skipped without a host
-    /// page-table scan. Falls back to the full region list when dirty
+    /// enabled, advises Firecracker's cumulative dirty view — every page the
+    /// guest wrote since the memory baseline — minus the pages its balloon has
+    /// discarded. The union reclaims pages paged out earlier and only read
+    /// back in since, which write-only KVM windows miss; pages still in swap
+    /// are walked without I/O and balloon-freed pages are skipped without a
+    /// host page-table scan. Falls back to the full region list when dirty
     /// tracking is off (e.g. PVM mode) or the query fails.
     async fn pageout_targets(&self) -> PageoutTargets {
         if !ConfigManager::global_config()
@@ -786,17 +788,16 @@ impl FirecrackerSandbox {
         let stage_timer = SandboxStageTimer::new("v_pause");
         match stage_timer
             .time(
-                "dirty_window_query",
-                self.fc_instance.get_dirty_window_ranges(),
+                "dirty_union_query",
+                self.fc_instance.get_dirty_union_ranges(),
             )
             .await
         {
             Ok(ranges) => {
-                let window_bytes =
-                    u64::try_from(ranges.dirty_ranges.iter().map(|r| r.length).sum::<i64>())
-                        .unwrap_or(0);
-                metrics::counter!("agentenv_v_pause_pageout_dirty_window_bytes_total")
-                    .increment(window_bytes);
+                let union_bytes =
+                    u64::try_from(ranges.ranges.iter().map(|r| r.length).sum::<i64>()).unwrap_or(0);
+                metrics::counter!("agentenv_v_pause_pageout_dirty_union_bytes_total")
+                    .increment(union_bytes);
                 let discarded_bytes = u64::try_from(
                     ranges
                         .discarded_ranges
@@ -810,12 +811,12 @@ impl FirecrackerSandbox {
                         .increment(discarded_bytes);
                 }
                 match pageout_regions_from_dirty(&ranges) {
-                    Ok(Some(regions)) => PageoutTargets::DirtyWindow(regions),
+                    Ok(Some(regions)) => PageoutTargets::DirtyUnion(regions),
                     Ok(None) => {
                         metrics::counter!(
                             "agentenv_v_pause_pageout_paths_total",
                             "path" => "skip",
-                            "reason" => "empty_window",
+                            "reason" => "empty_union",
                         )
                         .increment(1);
                         PageoutTargets::Skip
