@@ -585,18 +585,22 @@ impl FirecrackerInstance {
     }
 
     /// Returns the cumulative dirty view (every page written since the memory
-    /// baseline, e.g. the snapshot load) and the balloon discard log for vPause
-    /// pageout. A union covers pages paged out and only read back in since,
-    /// which no longer appear in a write-only KVM window; pages still in swap
-    /// cost an advise walk without I/O. The window and the discard log are
-    /// cleared by the query either way, but vPause no longer consumes the
-    /// window and the snapshot path's cumulative view stays intact.
+    /// baseline, e.g. the snapshot load), the current dirty-log window, and
+    /// the balloon discard log for vPause pageout. The union covers pages
+    /// paged out and only read back in since, which no longer appear in a
+    /// write-only KVM window; pages still in swap cost an advise walk without
+    /// I/O. The window — writes since the previous query — is excluded from
+    /// the victim list: resume re-accesses the last run round's writes within
+    /// seconds, so they stay resident instead of ping-ponging through swap.
+    /// The window and the discard log are cleared by the query, but only
+    /// vPause consumes them and the snapshot path's cumulative view stays
+    /// intact.
     #[tracing::instrument(skip(self))]
     pub async fn get_dirty_union_ranges(&self) -> Result<DirtyMemoryRanges> {
         self.client
             .request::<(), DirtyMemoryRanges>(
                 Method::GET,
-                "/vm/dirty-memory-ranges?views=snapshot,discards",
+                "/vm/dirty-memory-ranges?views=snapshot,window,discards",
                 None,
             )
             .await

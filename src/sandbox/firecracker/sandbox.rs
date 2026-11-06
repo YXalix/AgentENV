@@ -767,11 +767,14 @@ impl FirecrackerSandbox {
     /// Picks the pageout victim set for this pause. With KVM dirty tracking
     /// enabled, advises Firecracker's cumulative dirty view — every page the
     /// guest wrote since the memory baseline — minus the pages its balloon has
-    /// discarded. The union reclaims pages paged out earlier and only read
-    /// back in since, which write-only KVM windows miss; pages still in swap
-    /// are walked without I/O and balloon-freed pages are skipped without a
-    /// host page-table scan. Falls back to the full region list when dirty
-    /// tracking is off (e.g. PVM mode) or the query fails.
+    /// discarded and minus the current dirty-log window. The union reclaims
+    /// pages paged out earlier and only read back in since, which write-only
+    /// KVM windows miss; pages still in swap are walked without I/O and
+    /// balloon-freed pages are skipped without a host page-table scan. The
+    /// window is excluded because resume re-accesses the last run round's
+    /// writes within seconds, so those pages stay resident instead of
+    /// ping-ponging through swap. Falls back to the full region list when
+    /// dirty tracking is off (e.g. PVM mode) or the query fails.
     async fn pageout_targets(&self) -> PageoutTargets {
         if !ConfigManager::global_config()
             .memory_snapshot
@@ -798,6 +801,11 @@ impl FirecrackerSandbox {
                     u64::try_from(ranges.ranges.iter().map(|r| r.length).sum::<i64>()).unwrap_or(0);
                 metrics::counter!("agentenv_v_pause_pageout_dirty_union_bytes_total")
                     .increment(union_bytes);
+                let window_bytes =
+                    u64::try_from(ranges.dirty_ranges.iter().map(|r| r.length).sum::<i64>())
+                        .unwrap_or(0);
+                metrics::counter!("agentenv_v_pause_pageout_dirty_window_bytes_total")
+                    .increment(window_bytes);
                 let discarded_bytes = u64::try_from(
                     ranges
                         .discarded_ranges

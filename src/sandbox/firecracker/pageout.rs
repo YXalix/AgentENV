@@ -12,14 +12,19 @@
 //!
 //! - Dirty-driven (default when `memory_snapshot.track_dirty_pages` is on):
 //!   Firecracker reports its cumulative dirty view (`ranges`, every page the
-//!   guest wrote since the memory baseline) and the ranges its balloon has
-//!   discarded since the previous query (`discarded_ranges`, reading as zero
-//!   afterwards). This module subtracts the discarded ranges — pages freed
-//!   after being written are dead — so `MADV_PAGEOUT` never walks pages the
-//!   guest never wrote or has already freed, with no host page-table scan.
-//!   The union reclaims pages an earlier pageout swapped out and the guest
-//!   only read back in, which write-only KVM windows miss; pages still in
-//!   swap are inside the union but advising them costs a walk without I/O.
+//!   guest wrote since the memory baseline), the current dirty-log window
+//!   (`dirty_ranges`, writes since the previous query, cleared by it), and
+//!   the ranges its balloon has discarded since the previous query
+//!   (`discarded_ranges`, reading as zero afterwards). The victims are the
+//!   union minus the discards minus the window, so `MADV_PAGEOUT` never
+//!   walks pages the guest never wrote or has already freed, with no host
+//!   page-table scan. The window is excluded because resume re-accesses the
+//!   last run round's writes within seconds: advising them would only buy a
+//!   swap-out now followed by a swap-in on resume, while sparing them keeps
+//!   the per-round working set resident and the stale remainder — swapped
+//!   out once — costs only a walk without I/O afterwards. A first query's
+//!   window equals the union (nothing was cleared before), so the first
+//!   pause after a baseline advises nothing.
 //! - Full-region fallback (dirty tracking off, e.g. PVM mode, or when the
 //!   dirty query fails): the job advises the whole guest memory region list.
 //!
@@ -390,14 +395,19 @@ fn push_victim(
 }
 
 /// Converts Firecracker's cumulative dirty view minus balloon
-/// free-page-reporting discards into advise targets. The union covers every
-/// page written since the memory baseline, so pages swapped out earlier and
-/// only read back in since are re-advised; pages written and then discarded
-/// are dead (their content reads as zero and they are typically
-/// non-present); pages still in swap stay in the union but advising them
-/// costs a walk without I/O. Returns `None` when nothing survives; an error
-/// means the response cannot be advised as-is and the caller should fall
-/// back to the full region list.
+/// free-page-reporting discards and the current dirty-log window into advise
+/// targets. The union covers every page written since the memory baseline,
+/// so pages swapped out earlier and only read back in since are re-advised;
+/// pages written and then discarded are dead (their content reads as zero
+/// and they are typically non-present); pages still in swap stay in the
+/// union but advising them costs a walk without I/O. The window — writes
+/// since the previous query — is excluded: resume re-accesses the last run
+/// round's writes within seconds, so advising them would only buy a
+/// swap-out now followed by a swap-in on resume, and a first query's window
+/// equals the union, leaving the first pause after a baseline nothing to
+/// advise. Returns `None` when nothing survives; an error means the
+/// response cannot be advised as-is and the caller should fall back to the
+/// full region list.
 pub(crate) fn pageout_regions_from_dirty(
     ranges: &DirtyMemoryRanges,
 ) -> Result<Option<Vec<GuestRegionUffdMapping>>> {
@@ -406,7 +416,10 @@ pub(crate) fn pageout_regions_from_dirty(
         "unsupported pageout page size {}",
         ranges.page_size
     );
-    let victims = subtract_ranges(&ranges.ranges, &ranges.discarded_ranges);
+    let victims = subtract_ranges(
+        &subtract_ranges(&ranges.ranges, &ranges.discarded_ranges),
+        &ranges.dirty_ranges,
+    );
     if victims.is_empty() {
         return Ok(None);
     }
@@ -777,6 +790,48 @@ mod tests {
             base + 5 * PAGEOUT_PAGE_SIZE as i64
         );
         assert_eq!(regions[2].offset, (5 * PAGEOUT_PAGE_SIZE) as i64);
+        Ok(())
+    }
+
+    /// Window pages — the last run round's writes — are spared: resume
+    /// re-accesses them within seconds, so only the stale union remainder is
+    /// advised, in ascending slot order.
+    #[test]
+    fn pageout_regions_from_dirty_excludes_window() -> Result<()> {
+        let base = 0x7f00_0000_0000i64;
+        let page = PAGEOUT_PAGE_SIZE as i64;
+        let ranges = DirtyMemoryRanges::new(
+            4096,
+            6 * page,
+            vec![DirtyMemoryRange::new(base, 0, 6 * page)],
+            vec![DirtyMemoryRange::new(base + 4 * page, 4 * page, page)],
+            Vec::new(),
+        );
+
+        let regions = pageout_regions_from_dirty(&ranges)
+            .expect("conversion succeeds")
+            .expect("victims survive");
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].offset, 0);
+        assert_eq!(regions[0].size, 4 * page);
+        assert_eq!(regions[1].offset, 5 * page);
+        Ok(())
+    }
+
+    /// The first query clears nothing beforehand, so its window equals the
+    /// union and the first pause after a baseline advises nothing.
+    #[test]
+    fn pageout_regions_from_dirty_skips_first_query() -> Result<()> {
+        let base = 0x7f00_0000_0000i64;
+        let page = PAGEOUT_PAGE_SIZE as i64;
+        let ranges = DirtyMemoryRanges::new(
+            4096,
+            2 * page,
+            vec![DirtyMemoryRange::new(base, 0, 2 * page)],
+            vec![DirtyMemoryRange::new(base, 0, 2 * page)],
+            Vec::new(),
+        );
+        assert!(pageout_regions_from_dirty(&ranges)?.is_none());
         Ok(())
     }
 
