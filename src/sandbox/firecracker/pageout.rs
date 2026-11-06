@@ -15,10 +15,16 @@
 //!   guest wrote since the memory baseline), the current dirty-log window
 //!   (`dirty_ranges`, writes since the previous query, cleared by it), and
 //!   the ranges its balloon has discarded since the previous query
-//!   (`discarded_ranges`, reading as zero afterwards). The victims are the
-//!   union minus the discards minus the window, so `MADV_PAGEOUT` never
-//!   walks pages the guest never wrote or has already freed, with no host
-//!   page-table scan. The window is excluded because resume re-accesses the
+//!   (`discarded_ranges`, reading as zero afterwards, cleared by the query).
+//!   The discard log is a per-query delta while the union accumulates, so
+//!   the caller folds each query's delta into a host-side cumulative
+//!   discard mask ([`advance_discard_mask`]) and the victims are the union
+//!   minus that mask minus the window, so `MADV_PAGEOUT` never walks pages
+//!   the guest never wrote or has already freed, with no host page-table
+//!   scan. Pages the guest re-wrote after a discard hold live data again
+//!   and drop back off the mask on the next fold, because the rewrite
+//!   appears in the window of that round. The window is excluded because
+//!   resume re-accesses the
 //!   last run round's writes within seconds: advising them would only buy a
 //!   swap-out now followed by a swap-in on resume, while sparing them keeps
 //!   the per-round working set resident and the stale remainder — swapped
@@ -394,10 +400,65 @@ fn push_victim(
     });
 }
 
-/// Converts Firecracker's cumulative dirty view minus balloon
-/// free-page-reporting discards and the current dirty-log window into advise
-/// targets. The union covers every page written since the memory baseline,
-/// so pages swapped out earlier and only read back in since are re-advised;
+/// Merges coalesced, ascending, disjoint `a` and `b` into one coalesced,
+/// ascending, disjoint list, matching on `image_offset` and coalescing
+/// overlapping and adjacent ranges. Kept pieces carry the earlier piece's
+/// host base; ranges of one memory slot share the same base layout, so for
+/// a merged span that choice is equivalent.
+fn union_ranges(a: &[DirtyMemoryRange], b: &[DirtyMemoryRange]) -> Vec<DirtyMemoryRange> {
+    let mut result: Vec<DirtyMemoryRange> = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() || j < b.len() {
+        let next = if j >= b.len() || (i < a.len() && a[i].image_offset <= b[j].image_offset) {
+            let range = a[i].clone();
+            i += 1;
+            range
+        } else {
+            let range = b[j].clone();
+            j += 1;
+            range
+        };
+        if let Some(last) = result.last_mut() {
+            let last_end = last.image_offset + last.length;
+            let next_end = next.image_offset + next.length;
+            if next.image_offset <= last_end {
+                last.length = last_end.max(next_end) - last.image_offset;
+                continue;
+            }
+        }
+        result.push(next);
+    }
+    result
+}
+
+/// Folds one query's balloon discard log into the sandbox's cumulative
+/// discard mask. `window` pages the guest re-wrote since the previous query
+/// hold live data again and come off the mask; `discards` — pages freed
+/// since the previous query — join it. The fold is needed because
+/// Firecracker clears its discard log on every query while the dirty union
+/// keeps accumulating: without the host-side mask every round would re-walk
+/// every balloon-freed page, and once the balloon inflates the dead pages
+/// dominate the victims. A page discarded and re-written within one window
+/// is indistinguishable by write order and stays masked; the residue is
+/// bounded by a single round's churn.
+pub(crate) fn advance_discard_mask(
+    mask: Vec<DirtyMemoryRange>,
+    window: &[DirtyMemoryRange],
+    discards: &[DirtyMemoryRange],
+) -> Vec<DirtyMemoryRange> {
+    union_ranges(&subtract_ranges(&mask, window), discards)
+}
+
+/// Converts Firecracker's cumulative dirty view minus the cumulative balloon
+/// free-page-reporting discard mask and the current dirty-log window into
+/// advise targets. `discard_mask` accumulates the balloon's freed pages
+/// across queries: Firecracker clears its discard log on every query while
+/// the union accumulates, so within one query the fresh `discarded_ranges`
+/// alone would miss every earlier round's frees. The fresh delta is
+/// subtracted as well, so callers may pass the mask before or after folding
+/// the delta into it. The union covers every page written since the memory
+/// baseline, so pages swapped out earlier and only read back in since are
+/// re-advised;
 /// pages written and then discarded are dead (their content reads as zero
 /// and they are typically non-present); pages still in swap stay in the
 /// union but advising them costs a walk without I/O. The window — writes
@@ -410,6 +471,7 @@ fn push_victim(
 /// full region list.
 pub(crate) fn pageout_regions_from_dirty(
     ranges: &DirtyMemoryRanges,
+    discard_mask: &[DirtyMemoryRange],
 ) -> Result<Option<Vec<GuestRegionUffdMapping>>> {
     ensure!(
         ranges.page_size == PAGEOUT_PAGE_SIZE as i32,
@@ -417,7 +479,10 @@ pub(crate) fn pageout_regions_from_dirty(
         ranges.page_size
     );
     let victims = subtract_ranges(
-        &subtract_ranges(&ranges.ranges, &ranges.discarded_ranges),
+        &subtract_ranges(
+            &ranges.ranges,
+            &union_ranges(discard_mask, &ranges.discarded_ranges),
+        ),
         &ranges.dirty_ranges,
     );
     if victims.is_empty() {
@@ -772,7 +837,7 @@ mod tests {
             )],
         );
 
-        let regions = pageout_regions_from_dirty(&ranges)
+        let regions = pageout_regions_from_dirty(&ranges, &[])
             .expect("conversion succeeds")
             .expect("victims survive");
         assert_eq!(regions.len(), 3);
@@ -808,7 +873,7 @@ mod tests {
             Vec::new(),
         );
 
-        let regions = pageout_regions_from_dirty(&ranges)
+        let regions = pageout_regions_from_dirty(&ranges, &[])
             .expect("conversion succeeds")
             .expect("victims survive");
         assert_eq!(regions.len(), 2);
@@ -831,14 +896,89 @@ mod tests {
             vec![DirtyMemoryRange::new(base, 0, 2 * page)],
             Vec::new(),
         );
-        assert!(pageout_regions_from_dirty(&ranges)?.is_none());
+        assert!(pageout_regions_from_dirty(&ranges, &[])?.is_none());
         Ok(())
+    }
+
+    /// Discards accumulated from earlier queries keep masking their pages
+    /// even when the current query's discard log is empty — Firecracker
+    /// clears it on every query while the union keeps the pages listed.
+    #[test]
+    fn pageout_regions_from_dirty_subtracts_accumulated_mask() -> Result<()> {
+        let base = 0x7f00_0000_0000i64;
+        let page = PAGEOUT_PAGE_SIZE as i64;
+        let ranges = DirtyMemoryRanges::new(
+            4096,
+            6 * page,
+            vec![DirtyMemoryRange::new(base, 0, 6 * page)],
+            Vec::new(),
+            Vec::new(),
+        );
+        let mask = vec![DirtyMemoryRange::new(base + page, page, 2 * page)];
+
+        let regions = pageout_regions_from_dirty(&ranges, &mask)?.expect("victims survive");
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].offset, 0);
+        assert_eq!(regions[0].size, page);
+        assert_eq!(regions[1].offset, 3 * page);
+        Ok(())
+    }
+
+    /// `advance_discard_mask` drops pages the guest re-wrote in the last
+    /// window — they hold live data again — and absorbs the fresh discard
+    /// delta, keeping the mask coalesced and ascending.
+    #[test]
+    fn advance_discard_mask_unmasks_rewrites_and_absorbs_discards() {
+        let base = 0x7f00_0000_0000i64;
+        let page = PAGEOUT_PAGE_SIZE as i64;
+        let mask = vec![
+            DirtyMemoryRange::new(base + page, page, 2 * page),
+            DirtyMemoryRange::new(base + 5 * page, 5 * page, 2 * page),
+        ];
+        let window = vec![DirtyMemoryRange::new(base + 2 * page, 2 * page, page)];
+        let discards = vec![DirtyMemoryRange::new(base + 8 * page, 8 * page, page)];
+
+        let mask = advance_discard_mask(mask, &window, &discards);
+        assert_eq!(
+            mask,
+            vec![
+                DirtyMemoryRange::new(base + page, page, page),
+                DirtyMemoryRange::new(base + 5 * page, 5 * page, 2 * page),
+                DirtyMemoryRange::new(base + 8 * page, 8 * page, page),
+            ]
+        );
+    }
+
+    /// `union_ranges` interleaves both inputs in image-offset order and
+    /// coalesces overlapping and adjacent pieces.
+    #[test]
+    fn union_ranges_merges_overlapping_adjacent_and_interleaved() {
+        let base = 0x7f00_0000_0000i64;
+        let page = PAGEOUT_PAGE_SIZE as i64;
+        let a = vec![
+            DirtyMemoryRange::new(base, 0, 3 * page),
+            DirtyMemoryRange::new(base + 5 * page, 5 * page, page),
+        ];
+        let b = vec![
+            DirtyMemoryRange::new(base + 2 * page, 2 * page, 2 * page),
+            DirtyMemoryRange::new(base + 6 * page, 6 * page, 2 * page),
+            DirtyMemoryRange::new(base + 10 * page, 10 * page, page),
+        ];
+
+        assert_eq!(
+            union_ranges(&a, &b),
+            vec![
+                DirtyMemoryRange::new(base, 0, 4 * page),
+                DirtyMemoryRange::new(base + 5 * page, 5 * page, 3 * page),
+                DirtyMemoryRange::new(base + 10 * page, 10 * page, page),
+            ]
+        );
     }
 
     #[test]
     fn pageout_regions_from_dirty_reports_empty_union() -> Result<()> {
         let ranges = DirtyMemoryRanges::new(4096, 0, Vec::new(), Vec::new(), Vec::new());
-        assert!(pageout_regions_from_dirty(&ranges)?.is_none());
+        assert!(pageout_regions_from_dirty(&ranges, &[])?.is_none());
 
         // A union fully covered by discards also yields nothing to advise.
         let covered = DirtyMemoryRanges::new(
@@ -856,7 +996,7 @@ mod tests {
                 (2 * PAGEOUT_PAGE_SIZE) as i64,
             )],
         );
-        assert!(pageout_regions_from_dirty(&covered)?.is_none());
+        assert!(pageout_regions_from_dirty(&covered, &[])?.is_none());
         Ok(())
     }
 
@@ -869,7 +1009,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        assert!(pageout_regions_from_dirty(&ranges).is_err());
+        assert!(pageout_regions_from_dirty(&ranges, &[]).is_err());
     }
 
     #[test]

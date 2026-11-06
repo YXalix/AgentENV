@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
-use firecracker_client::models::GuestRegionUffdMapping;
+use firecracker_client::models::{DirtyMemoryRange, GuestRegionUffdMapping};
 use nix::libc;
 use tempfile::TempDir;
 use tracing::{debug, trace, warn};
@@ -22,7 +22,7 @@ use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
     restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
 };
-use super::pageout::{pageout_regions_from_dirty, PageoutControl};
+use super::pageout::{advance_discard_mask, pageout_regions_from_dirty, PageoutControl};
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::{FirecrackerInstance, SANDBOX_NET_IFACE_ID, SANDBOX_TAP_IFACE_NAME};
 use crate::sandbox::custom_extension::{
@@ -188,6 +188,13 @@ pub struct FirecrackerSandbox {
     /// Background pageout lifecycle for vPause: `v_pause` submits a job here,
     /// resume/snapshot/teardown cancel it. The pool is process-global.
     pageout: Arc<PageoutControl>,
+    /// Cumulative balloon free-page-reporting discard mask across vPause
+    /// rounds, keyed by memory-image offset. Firecracker clears its discard
+    /// log on every dirty query while the dirty union keeps accumulating, so
+    /// this mask is what keeps already-freed pages out of the pageout
+    /// victims. Folded in `pageout_targets`; empty for a fresh or restored
+    /// VM, whose baseline resets with the snapshot load.
+    pageout_discard_mask: Vec<DirtyMemoryRange>,
     network_slot: Option<Slot>,
     current_network_policy: Option<SandboxNetworkPolicy>,
     /// Current custom extension params. Initialized from the launch config and
@@ -228,7 +235,8 @@ pub struct FirecrackerSandbox {
 
 /// What to advise for one vPause pageout.
 enum PageoutTargets {
-    /// The cumulative dirty view minus balloon-discarded pages.
+    /// The cumulative dirty view minus the accumulated balloon-discard mask
+    /// and the current dirty window.
     DirtyUnion(Vec<GuestRegionUffdMapping>),
     /// The whole guest memory region list.
     FullRegions,
@@ -766,8 +774,10 @@ impl SandboxExecutor for FirecrackerSandbox {
 impl FirecrackerSandbox {
     /// Picks the pageout victim set for this pause. With KVM dirty tracking
     /// enabled, advises Firecracker's cumulative dirty view — every page the
-    /// guest wrote since the memory baseline — minus the pages its balloon has
-    /// discarded and minus the current dirty-log window. The union reclaims
+    /// guest wrote since the memory baseline — minus the pages its balloon
+    /// has discarded (accumulated host-side across queries: Firecracker
+    /// clears its discard log on every query while the union keeps every
+    /// page) and minus the current dirty-log window. The union reclaims
     /// pages paged out earlier and only read back in since, which write-only
     /// KVM windows miss; pages still in swap are walked without I/O and
     /// balloon-freed pages are skipped without a host page-table scan. The
@@ -775,7 +785,7 @@ impl FirecrackerSandbox {
     /// writes within seconds, so those pages stay resident instead of
     /// ping-ponging through swap. Falls back to the full region list when
     /// dirty tracking is off (e.g. PVM mode) or the query fails.
-    async fn pageout_targets(&self) -> PageoutTargets {
+    async fn pageout_targets(&mut self) -> PageoutTargets {
         if !ConfigManager::global_config()
             .memory_snapshot
             .track_dirty_pages
@@ -818,7 +828,28 @@ impl FirecrackerSandbox {
                     metrics::counter!("agentenv_v_pause_pageout_discard_masked_bytes_total")
                         .increment(discarded_bytes);
                 }
-                match pageout_regions_from_dirty(&ranges) {
+                // Fold this query's discard delta into the cumulative mask
+                // before building the victims. A snapshot capture's plain
+                // dirty query also clears Firecracker's discard log without
+                // feeding this mask; only `[v_pause].stop_vcpus = false`
+                // leaves the guest running room to discard in that gap, and
+                // the bounded cost is those pages keep being walked, as
+                // every discarded page did before the mask existed.
+                self.pageout_discard_mask = advance_discard_mask(
+                    std::mem::take(&mut self.pageout_discard_mask),
+                    &ranges.dirty_ranges,
+                    &ranges.discarded_ranges,
+                );
+                let mask_bytes = u64::try_from(
+                    self.pageout_discard_mask
+                        .iter()
+                        .map(|r| r.length)
+                        .sum::<i64>(),
+                )
+                .unwrap_or(0);
+                metrics::gauge!("agentenv_v_pause_pageout_discard_mask_bytes")
+                    .set(mask_bytes as f64);
+                match pageout_regions_from_dirty(&ranges, &self.pageout_discard_mask) {
                     Ok(Some(regions)) => PageoutTargets::DirtyUnion(regions),
                     Ok(None) => {
                         metrics::counter!(
@@ -1990,6 +2021,7 @@ impl FirecrackerSandbox {
             v_paused: false,
             vcpus_stopped: false,
             pageout: Arc::new(PageoutControl::new()),
+            pageout_discard_mask: Vec::new(),
             network_slot: None,
             current_network_policy,
             current_custom_extension_params,

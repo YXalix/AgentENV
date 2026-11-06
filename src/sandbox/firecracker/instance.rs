@@ -594,7 +594,10 @@ impl FirecrackerInstance {
     /// seconds, so they stay resident instead of ping-ponging through swap.
     /// The window and the discard log are cleared by the query, but only
     /// vPause consumes them and the snapshot path's cumulative view stays
-    /// intact.
+    /// intact. vPause folds the discard delta into a cumulative host-side
+    /// mask: the union it subtracts from is cumulative while this log is a
+    /// per-query delta, so an unfolded log would leave every earlier round's
+    /// balloon-freed page in the victims forever.
     #[tracing::instrument(skip(self))]
     pub async fn get_dirty_union_ranges(&self) -> Result<DirtyMemoryRanges> {
         self.client

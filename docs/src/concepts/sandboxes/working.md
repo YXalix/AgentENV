@@ -85,8 +85,9 @@ thousands of sandboxes at once cannot stampede the host's swap subsystem.
 With `memory_snapshot.track_dirty_pages = true` (the KVM-mode default),
 workers advise the sandbox's cumulative dirty view — every page the guest
 wrote since the memory baseline — minus the pages Firecracker's balloon has
-discarded and minus the current dirty window (the pages written since the
-previous query). The union reclaims pages an earlier pageout swapped out and
+discarded (accumulated host-side across queries, since the balloon's discard
+log resets on every query while the union accumulates) and minus the current
+dirty window (the pages written since the previous query). The union reclaims pages an earlier pageout swapped out and
 the guest only read back in since, which a write-only KVM window would miss;
 pages that were never written, still sit in swap (advise walks them without
 I/O), or were freed by the guest after being written cost no swap work, and
