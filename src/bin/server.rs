@@ -58,6 +58,15 @@ async fn main() -> anyhow::Result<()> {
     agentenv::logging::init();
     agentenv_observability::init_prometheus_recorder()?;
 
+    // vPause keeps the host near reclaim pressure; a swapped-out server would
+    // fault its own code and heap back in on every vPause resume. Lock early,
+    // while the resident set is still small. Best-effort: the installed
+    // systemd unit grants LimitMEMLOCK=infinity, and running degraded with a
+    // swappable server beats refusing to start.
+    if let Err(error) = storage_util::lock_process_memory() {
+        warn!(target: "agentenv", error = %error, "failed to lock server memory; the server may be swapped out under memory pressure");
+    }
+
     let cli = ServerCli::parse();
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
         agentenv::cfg::ConfigManager::init_global_from_path(config_path)?

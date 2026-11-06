@@ -267,6 +267,16 @@ fn main() -> Result<()> {
         tracing::warn!(?err, target, "failed to raise RLIMIT_NOFILE");
     }
 
+    // Keep the daemon resident: it serves ublk I/O for every sandbox, and
+    // being swapped out under guest-memory reclaim pressure would stall all
+    // devices behind it. Best-effort: warn and continue swappable.
+    if let Err(err) = storage_util::lock_process_memory() {
+        tracing::warn!(
+            ?err,
+            "failed to lock daemon memory; the daemon may be swapped out under memory pressure"
+        );
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()

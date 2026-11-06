@@ -98,6 +98,11 @@ the stale remainder is swapped out once and then only walked. The first
 pause after a memory baseline advises nothing, since its window still equals
 the union.
 Otherwise the whole guest memory is advised.
+The host daemons stay out of that swap churn: the AgentENV server and the
+ublk daemon lock their memory resident at startup (`mlockall`, best-effort —
+the installed systemd unit grants `LimitMEMLOCK=infinity`), so a vPause resume
+never pays to fault them back in. The Firecracker processes stay swappable on
+purpose: their guest memory is what the pageout reclaims.
 Resume cancels any remaining pageout (waiting at most one chunk) and continues
 that process, faulting memory back on demand; no
 snapshot is written. This live-vPause state is node-local and is not recovered
