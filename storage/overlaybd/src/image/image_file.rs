@@ -321,9 +321,13 @@ impl ImageFile {
             .context("prepare fresh upper after restack")?;
 
             let new_upper_data: Arc<dyn VirtualFile> = Arc::new(
-                LocalFile::open_rw(&upper_data_path, false).with_context(|| {
-                    format!("open fresh upper data {}", upper_data_path.display())
-                })?,
+                LocalFile::builder()
+                    .create(false)
+                    .direct_io(true)
+                    .open(&upper_data_path)
+                    .with_context(|| {
+                        format!("open fresh upper data {}", upper_data_path.display())
+                    })?,
             );
             let new_upper_index = match upper_mode {
                 UpperMode::Sparse => None,
@@ -606,7 +610,12 @@ impl ImageFile {
             ));
         }
 
-        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&upper.data, false)?);
+        let data_file: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::builder()
+                .create(false)
+                .direct_io(true)
+                .open(&upper.data)?,
+        );
         let idx_file = match upper.writable_mode() {
             UpperMode::Sparse => None,
             UpperMode::LogStructured | UpperMode::HybridLogStructured => {
