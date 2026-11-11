@@ -394,6 +394,9 @@ impl SandboxBackend for FirecrackerSandbox {
         if self.v_paused {
             return Ok(());
         }
+        // Release guest free pages while the guest can still run its driver,
+        // so the pageout below only has to drain live memory. Best-effort.
+        self.release_guest_free_pages().await;
         // `[v_pause].stop_vcpus = false` keeps the vCPUs running: vPause then
         // only queues the pageout below, opportunistically reclaiming idle
         // guest pages while the workload continues.
@@ -1440,6 +1443,36 @@ impl FirecrackerSandbox {
         self.pageout.wait_until_settled(timeout).await
     }
 
+    /// Releases guest free pages with one free page hinting round while the
+    /// vCPUs still run, shrinking what the pageout has to drain.
+    ///
+    /// Best-effort: sandboxes restored from snapshots whose balloon device
+    /// was created without pre-boot hinting fall back to pageout, and a guest
+    /// that never finishes only costs the bounded wait.
+    async fn release_guest_free_pages(&self) {
+        let config = ConfigManager::global_config();
+        if !config.v_pause.hinting_kick {
+            return;
+        }
+        let timeout = std::time::Duration::from_millis(config.v_pause.hinting_kick_timeout_ms);
+        let started = std::time::Instant::now();
+        match self.fc_instance.run_free_page_hinting(timeout).await {
+            Ok(()) => debug!(
+                sandbox_id = %self.id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "free page hinting completed"
+            ),
+            Err(error) => {
+                metrics::counter!("agentenv_v_pause_hinting_kick_failures_total").increment(1);
+                warn!(
+                    sandbox_id = %self.id,
+                    error = %error,
+                    "free page hinting failed; continuing vPause"
+                );
+            }
+        }
+    }
+
     /// Resume a paused sandbox in-place.
     ///
     /// Use this when you want to keep the same sandbox instance.
@@ -2031,8 +2064,8 @@ impl FirecrackerSandbox {
         // NOTE: The virtio-balloon device is NOT configured here. Balloon state
         // is part of vm_state.bin and is restored automatically by Firecracker.
         // Snapshots taken before balloon support was added will simply not have
-        // the device — free_page_reporting will be absent for those VMs, which
-        // is acceptable during rollout.
+        // the device — free page reporting and hinting will be absent for those
+        // VMs, which is acceptable during rollout.
 
         // Fail fast: memory restore requires a ublk device. Check before
         // allocating any resources (Firecracker process, network namespace, …).
@@ -2576,10 +2609,11 @@ impl FirecrackerSandbox {
             self.fc_instance.set_mmds(&mmds_metadata).await?;
         }
 
-        // ── Balloon: enable free page reporting ──
+        // ── Balloon: enable free page reporting and hinting ──
         // Paired with DAMON reclaim (kernel boot args): DAMON reclaims cold
         // pagecache pages inside the guest, and the balloon device reports the
         // resulting free pages to the host VMM so it can release physical memory.
+        // vPause can additionally kick an on-demand hinting run before pageout.
         self.fc_instance.set_balloon().await?;
 
         Ok(())

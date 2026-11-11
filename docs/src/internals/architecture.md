@@ -117,7 +117,7 @@ Memory snapshot restore uses ublk-backed overlaybd devices rather than userfault
 
 **Memory snapshot creation**: On heavy-pause, Firecracker creates a state-only diff snapshot. AgentENV queries Firecracker's dirty/present memory ranges, reads the selected memory with `process_vm_readv`, and directly creates the OverlayBD memory layer. Parent layers from previous snapshots are stacked, forming the full layered memory image.
 
-**Live-vPause**: When `[v_pause]` is enabled on KVM, explicit Pause does not create these artifacts. It pauses the vCPUs and applies `process_madvise(MADV_PAGEOUT)` to guest regions, using host swap. The same Firecracker process resumes in place. Timeout conversion and graceful shutdown resume first, then use the heavy-pause creation path above.
+**Live-vPause**: When `[v_pause]` is enabled on KVM, explicit Pause does not create these artifacts. It first kicks a best-effort free page hinting run to release guest free pages with `MADV_DONTNEED`, then pauses the vCPUs and applies `process_madvise(MADV_PAGEOUT)` to the remaining guest regions, using host swap. The same Firecracker process resumes in place. Timeout conversion and graceful shutdown resume first, then use the heavy-pause creation path above.
 
 > **Note**: `storage/uffd-core/` contains an alternative userfaultfd-based memory restore implementation that is retained for reference but excluded from the workspace build.
 

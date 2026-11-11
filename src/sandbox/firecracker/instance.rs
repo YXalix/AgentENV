@@ -11,9 +11,9 @@ use firecracker_client::models::instance_action_info::ActionType;
 use firecracker_client::models::vm::State as VmState;
 use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig, PartialDrive};
 use firecracker_client::models::{
-    Balloon, BootSource, DirtyMemoryRanges, Drive, GuestRegionUffdMapping, InstanceActionInfo,
-    Logger, MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, RateLimiter,
-    SnapshotCreateParams, SnapshotLoadParams, Vm,
+    Balloon, BalloonHintingStatus, BalloonStartCmd, BootSource, DirtyMemoryRanges, Drive,
+    GuestRegionUffdMapping, InstanceActionInfo, Logger, MachineConfiguration, MemoryBackend,
+    NetworkInterface, NetworkOverride, RateLimiter, SnapshotCreateParams, SnapshotLoadParams, Vm,
 };
 use hyper::Method;
 use nix::sys::signal::{kill, Signal};
@@ -32,6 +32,9 @@ use crate::privileges::{ScopedChild, ScopedSpawnSpec};
 /// injected via the extra MMDS metadata pass-through.
 const MMDS_SIZE_LIMIT: usize = 1_048_576;
 const HTTP_API_MAX_PAYLOAD_SIZE: usize = MMDS_SIZE_LIMIT;
+
+const FREE_PAGE_HINT_DONE: i32 = 1;
+const FREE_PAGE_HINTING_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Firecracker interface id of the sandbox network device, and the persistent
 /// TAP interface backing it inside the sandbox network namespace.
@@ -492,24 +495,78 @@ impl FirecrackerInstance {
             .context("Failed to set MMDS data")
     }
 
-    /// Configures the virtio-balloon device with free page reporting enabled.
+    /// Configures the virtio-balloon device with free page reporting and
+    /// free page hinting enabled.
     ///
     /// Pre-boot only. Sets `amount_mib = 0` (no target inflation) and
-    /// `deflate_on_oom = true` as a safety net. The primary purpose is to
-    /// enable free page reporting so the guest kernel can return unused pages
-    /// to the host via `MADV_DONTNEED`, reducing host memory pressure.
+    /// `deflate_on_oom = true` as a safety net. Free page reporting lets the
+    /// guest kernel return unused pages to the host via `MADV_DONTNEED`,
+    /// reducing host memory pressure; free page hinting additionally lets the
+    /// host trigger a reclaim run itself (used by vPause to release guest
+    /// free pages before the pageout starts).
     pub async fn set_balloon(&self) -> Result<()> {
         let balloon = Balloon {
             amount_mib: 0,
             deflate_on_oom: true,
             stats_polling_interval_s: None,
-            free_page_hinting: None,
+            free_page_hinting: Some(true),
             free_page_reporting: Some(true),
         };
         self.client
             .request_no_content(Method::PUT, "/balloon", Some(&balloon))
             .await
             .context("Failed to set balloon configuration")
+    }
+
+    /// Runs one free page hinting round and waits for Firecracker to
+    /// acknowledge its completion within `timeout`.
+    ///
+    /// The guest driver streams its free page ranges to Firecracker, which
+    /// releases the backing host memory with `MADV_DONTNEED`. Automatic stop
+    /// acknowledgement then returns the free lists to the guest. Only
+    /// available when hinting was enabled pre-boot (see [`Self::set_balloon`]).
+    pub async fn run_free_page_hinting(&self, timeout: Duration) -> Result<()> {
+        time::timeout(timeout, async {
+            self.start_free_page_hinting().await?;
+            loop {
+                let status = self.get_free_page_hinting_status().await?;
+                if Self::free_page_hinting_complete(&status) {
+                    return Ok(());
+                }
+                time::sleep(FREE_PAGE_HINTING_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "guest driver did not finish hinting run within {} ms",
+                timeout.as_millis()
+            )
+        })?
+    }
+
+    async fn start_free_page_hinting(&self) -> Result<()> {
+        let cmd = BalloonStartCmd {
+            acknowledge_on_stop: Some(true),
+        };
+        self.client
+            .request_no_content(Method::PATCH, "/balloon/hinting/start", Some(&cmd))
+            .await
+            .context("Failed to start free page hinting")
+    }
+
+    async fn get_free_page_hinting_status(&self) -> Result<BalloonHintingStatus> {
+        self.client
+            .request::<(), BalloonHintingStatus>(Method::GET, "/balloon/hinting/status", None)
+            .await
+            .context("Failed to get free page hinting status")
+    }
+
+    fn free_page_hinting_complete(status: &BalloonHintingStatus) -> bool {
+        // A guest command matching the host command only acknowledges the
+        // start. Automatic acknowledgement moves host_cmd to DONE after the
+        // guest reports that all free ranges have been sent.
+        status.host_cmd == FREE_PAGE_HINT_DONE
     }
 
     /// Starts the microVM.
@@ -732,6 +789,24 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use tempfile::tempdir;
+
+    #[test]
+    fn free_page_hinting_waits_for_automatic_done() {
+        let status = |host_cmd, guest_cmd| BalloonHintingStatus {
+            host_cmd,
+            guest_cmd,
+        };
+
+        for (host_cmd, guest_cmd) in [(2, None), (2, Some(2)), (2, Some(0)), (3, Some(1))] {
+            assert!(!FirecrackerInstance::free_page_hinting_complete(&status(
+                host_cmd, guest_cmd
+            )));
+        }
+        assert!(FirecrackerInstance::free_page_hinting_complete(&status(
+            1,
+            Some(0)
+        )));
+    }
 
     #[tokio::test]
     async fn wait_for_ready_times_out_when_socket_never_appears() {

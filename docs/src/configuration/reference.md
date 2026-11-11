@@ -557,7 +557,7 @@ make them through the TOML settings, not by editing the generated JSON.
 
 ## `[v_pause]`
 
-Lightweight in-process Pause for KVM sandboxes. Explicit Pause stops the vCPUs and queues `process_madvise(MADV_PAGEOUT)` on guest memory for a pool of background workers while retaining the Firecracker process; the Pause call itself returns once the vCPUs stop, and reclaim completes asynchronously (best-effort). With `stop_vcpus = false`, the vCPUs keep running and vPause only queues the pageout: the Pause call returns once pageout is queued, and reclaim is opportunistic — guest pages fault back in when the workload touches them. Resume is lazy, cancels any remaining pageout, and does not recreate the VM. Long-idle timeout and graceful shutdown first resume the VM, then use the persistent heavy-pause path. vPause is node-local and is not recovered after an abnormal server or host crash.
+Lightweight in-process Pause for KVM sandboxes. Explicit Pause first kicks a best-effort free page hinting run while the vCPUs can still service it, releasing guest free pages with `MADV_DONTNEED`; it then stops the vCPUs and queues `process_madvise(MADV_PAGEOUT)` on the remaining guest memory for a pool of background workers while retaining the Firecracker process. The Pause call waits up to `hinting_kick_timeout_ms` for hinting and returns once the vCPUs stop and pageout is queued; pageout reclaim completes asynchronously. Sandboxes restored from snapshots without hinting support fall back to plain pageout. With `stop_vcpus = false`, the vCPUs keep running and vPause only queues the pageout after hinting: reclaim is opportunistic — guest pages fault back in when the workload touches them. Resume is lazy, cancels any remaining pageout, and does not recreate the VM. Long-idle timeout and graceful shutdown first resume the VM, then use the persistent heavy-pause path. vPause is node-local and is not recovered after an abnormal server or host crash.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -565,9 +565,11 @@ Lightweight in-process Pause for KVM sandboxes. Explicit Pause stops the vCPUs a
 | `pageout_workers` | usize | `8` | Background worker threads shared by all vPaused sandboxes. Bounds the number of concurrent `process_madvise(MADV_PAGEOUT)` streams regardless of how many sandboxes pause at once. Values below 1 are clamped to 1. |
 | `pageout_chunk_mib` | usize | `64` | Guest-memory bytes (MiB) one worker may advise per chunk. Also the cancellation granularity: snapshot capture waits at most one chunk for an in-flight chunk to finish; resume and teardown cancel without waiting. Values below 1 are clamped to 1. |
 | `stop_vcpus` | bool | `true` | Stop (pause) the vCPUs during vPause. When `false`, the vCPUs keep running and vPause only queues guest-memory pageout, opportunistically reclaiming idle guest pages to host swap; timeout and graceful shutdown still stop the VM before capturing a persistent snapshot. |
+| `hinting_kick` | bool | `true` | Kick one best-effort free page hinting run at the start of every vPause, before stopping vCPUs or queueing pageout. This releases guest free pages with `MADV_DONTNEED` so they need not be swapped out. |
+| `hinting_kick_timeout_ms` | u64 | `3000` | Maximum time to wait for the guest to finish each hinting run. On timeout or API failure, vPause continues with plain pageout. |
 
-vPause relies on host swap, provisioned and sized by the operator; without
-active swap, Pause stops the vCPUs but frees no host memory.
+Pageout relies on host swap, provisioned and sized by the operator; without
+active swap, only pages released by hinting or reporting reduce host memory.
 `scripts/zram-swap-setup.sh` configures a multi-device zram swap tier suited
 to vPause's concurrent pageout traffic (teardown:
 `scripts/zram-swap-teardown.sh`).

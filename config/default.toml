@@ -380,6 +380,12 @@ pageout_chunk_mib = 64
 # vPause only queues guest-memory pageout, opportunistically reclaiming idle
 # guest pages to host swap.
 stop_vcpus = true
+# Kick one free page hinting run before pageout so guest free pages are released
+# with MADV_DONTNEED instead of being swapped out. Best-effort; old snapshots
+# without hinting support fall back to plain pageout.
+hinting_kick = true
+# Maximum time to wait for the guest to finish each hinting run.
+hinting_kick_timeout_ms = 3000
 
 [memory_snapshot]
 # Generated OverlayBD config dedicated to memory snapshot devices.

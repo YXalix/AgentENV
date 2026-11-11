@@ -75,10 +75,13 @@ aenv download 018f0d93-aaaa-bbbb-cccc-0123456789ab /workspace/result.txt ./resul
 
 ## Pause and Resume
 
-When `[v_pause].enabled = true` on a KVM node, explicit Pause stops the vCPUs
-and pages guest memory into host swap while keeping the same microVM
-process. Pause returns as soon as the vCPUs stop; the memory reclaim itself is
-best-effort and continues on a small pool of background pageout workers
+When `[v_pause].enabled = true` on a KVM node, explicit Pause first runs
+best-effort free page hinting so the guest can release free pages without
+swapping them, then stops the vCPUs and pages the remaining guest memory into
+host swap while keeping the same microVM process. Pause waits up to
+`[v_pause].hinting_kick_timeout_ms` for hinting and returns once the vCPUs
+stop; the remaining memory reclaim continues on a small pool of background
+pageout workers
 (`[v_pause].pageout_workers` threads, each advising one
 `[v_pause].pageout_chunk_mib` chunk of one sandbox per turn) so pausing
 thousands of sandboxes at once cannot stampede the host's swap subsystem.

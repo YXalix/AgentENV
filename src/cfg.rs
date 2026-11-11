@@ -578,6 +578,20 @@ pub struct VPauseConfig {
     /// reclaiming idle guest pages to host swap.
     #[config(env = "AENV_V_PAUSE_STOP_VCPUS", default = true)]
     pub stop_vcpus: bool,
+    /// Kick a free page hinting run at the start of every vPause, while the
+    /// vCPUs can still service it: the guest driver streams its free page
+    /// ranges to Firecracker, which releases the backing host memory
+    /// (`MADV_DONTNEED`) before the pageout workers start draining what is
+    /// left. Requires hinting enabled pre-boot on the balloon device —
+    /// sandboxes restored from older templates skip the kick and fall back
+    /// to plain pageout.
+    #[config(env = "AENV_V_PAUSE_HINTING_KICK", default = true)]
+    pub hinting_kick: bool,
+    /// How long to wait for the guest driver to finish a hinting run before
+    /// giving up and continuing the pause anyway (missed pages are simply
+    /// reclaimed by the pageout instead).
+    #[config(env = "AENV_V_PAUSE_HINTING_KICK_TIMEOUT_MS", default = 3000u64)]
+    pub hinting_kick_timeout_ms: u64,
 }
 
 impl VPauseConfig {
@@ -1599,6 +1613,27 @@ mod tests {
         std::fs::write(&path, "[v_pause]\nstop_vcpus = false\n")?;
         let config = ConfigManager::new_from_path(&path)?;
         assert!(!config.config().v_pause.stop_vcpus);
+        Ok(())
+    }
+
+    #[test]
+    fn v_pause_hinting_kick_defaults_to_true_and_parses() -> Result<()> {
+        assert!(VPauseConfig::default().hinting_kick);
+        assert_eq!(VPauseConfig::default().hinting_kick_timeout_ms, 3000);
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        assert!(config.config().v_pause.hinting_kick);
+
+        let temp = tempdir()?;
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[v_pause]\nhinting_kick = false\nhinting_kick_timeout_ms = 500\n",
+        )?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert!(!config.config().v_pause.hinting_kick);
+        assert_eq!(config.config().v_pause.hinting_kick_timeout_ms, 500);
         Ok(())
     }
 
